@@ -1,4 +1,3 @@
----
 # Sentinel Agent 🛰️
 
 Sentinel Agent ist der leichtgewichtige, hochsichere Node-Agent, der auf Zielservern deployed wird, um lokale Befehle auszuführen, Telemetriedaten zu erfassen und den Sicherheitsstatus an den SentinelCore Hub zu melden.
