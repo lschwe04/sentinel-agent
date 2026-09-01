@@ -1,0 +1,13 @@
+agent:
+  node_id: "node-1234-prod"
+  listen_ip: "10.0.0.15"
+  listen_port: 9443
+  hub_url: "https://10.0.0.1:8443"
+  auth_token: "SECRET_ENTERPRISE_TOKEN" # In Produktion via Vault oder HashiCorp injiziert
+
+paths:
+  ansible_playbook: "/etc/sentinel/hardening.yml"
+  restic_binary: "/usr/bin/restic"
+
+security:
+  allow_commands_only_from_hub_ip: "10.0.0.1"
