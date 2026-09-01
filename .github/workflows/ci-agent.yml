@@ -1,4 +1,4 @@
-name: Sentinel Agent CI
+name: Enterprise CI / Security Audit
 
 on:
   push:
@@ -7,24 +7,23 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+  security-audit:
     runs-on: ubuntu-latest
     steps:
-      - name: Code auschecken
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Go einrichten
+      - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
 
-      - name: Abhängigkeiten laden
-        run: go mod download
+      - name: Run Go Vulnerability Checker (govulncheck)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
 
-      - name: Linter / Code-Prüfung (golangci-lint)
-        uses: golangci/golangci-lint-action@v6
+      - name: Run Gosec Security Linter
+        uses: securego/gosec@master
         with:
-          version: latest
-
-      - name: Kompilierungstest (Agent bauen)
-        run: go build -v -o sentinel-agent ./cmd/agent/main.go
+          args: ./...
