@@ -34,7 +34,7 @@ func RunAnsiblePlaybook(w http.ResponseWriter, r *http.Request) {
 
 	jobID := fmt.Sprintf("job-%d", time.Now().UnixNano())
 
-	// Asynchrone Ausführung im Hintergrund
+	// Asynchrone Ausführung des Härtungsprozesses
 	go func(id string) {
 		slog.Info("Starte asynchronen Härtungsprozess", "job_id", id)
 		cmd := exec.Command("ansible-playbook", "/etc/sentinel/playbooks/hardening.yml")
@@ -48,18 +48,17 @@ func RunAnsiblePlaybook(w http.ResponseWriter, r *http.Request) {
 			slog.Error("Ansible Härtung fehlgeschlagen", "job_id", id, "error", err)
 			success = false
 			msg = err.Error()
-			openIssues = 5 // Beispielhafter Wert bei Fehlern
+			openIssues = 3
 		} else {
 			slog.Info("Ansible Härtung erfolgreich abgeschlossen", "job_id", id)
 		}
 
-		// --- CLOSED LOOP: REPORT BACK TO HUB ---
+		// Closed-Loop: Status direkt per mTLS an den Hub melden
 		reportBackToHub(success, msg, openIssues)
 	}(jobID)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-
 	json.NewEncoder(w).Encode(ExecutionResponse{
 		JobID:   jobID,
 		Status:  "accepted",
@@ -74,7 +73,7 @@ func reportBackToHub(success bool, message string, openIssues int) {
 	}
 	nodeID := os.Getenv("NODE_ID")
 	if nodeID == "" {
-		nodeID = "unknown-node"
+		nodeID = "node-local-docker"
 	}
 
 	report := HardeningReport{
@@ -86,14 +85,14 @@ func reportBackToHub(success bool, message string, openIssues int) {
 
 	data, err := json.Marshal(report)
 	if err != nil {
-		slog.Error("Fehler beim Marshalling des Hardening-Reports", "error", err)
+		slog.Error("Fehler beim Marshalling des Reports", "error", err)
 		return
 	}
 
-	// mTLS Client für sicheren Callback zum Hub einrichten
+	// mTLS Client Konfiguration für sicheren Callback
 	cert, err := tls.LoadX509KeyPair("/etc/sentinel/certs/agent.crt", "/etc/sentinel/certs/agent.key")
 	if err != nil {
-		slog.Error("Callback mTLS Zertifikat Fehler", "error", err)
+		slog.Error("mTLS Zertifikat Fehler beim Callback", "error", err)
 		return
 	}
 	caCert, _ := os.ReadFile("/etc/sentinel/certs/ca.crt")
@@ -113,7 +112,7 @@ func reportBackToHub(success bool, message string, openIssues int) {
 
 	req, err := http.NewRequest(http.MethodPost, hubURL, bytes.NewBuffer(data))
 	if err != nil {
-		slog.Error("Fehler beim Erstellen des Callback-Requests", "error", err)
+		slog.Error("Fehler beim Erstellen des Requests", "error", err)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
