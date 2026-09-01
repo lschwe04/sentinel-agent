@@ -1,28 +1,26 @@
 [Unit]
-Description=SentinelCore Node Agent
-After=network.target wg-quick@wg0.service
-Requires=wg-quick@wg0.service
+Description=SentinelCore Enterprise Security & Monitoring Agent
+After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/sentinel-agent
-Restart=on-failure
-RestartSec=5
-User=sentinel
-Group=sentinel
+Type=simple
+User=root
+WorkingDirectory=/opt/sentinel-agent
+ExecStart=/opt/sentinel-agent/sentinel-agent
+Restart=always
+RestartSec=10
 
-# Enterprise Sandboxing
-NoNewPrivileges=true
+# Enterprise Sandboxing Best Practices
 ProtectSystem=strict
-ReadWritePaths=/var/log/sentinel /var/lib/sentinel
 ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
+NoNewPrivileges=true
 PrivateTmp=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+ProtectKernelTunables=true
+ProtectControlGroups=true
 MemoryDenyWriteExecute=true
-LockPersonality=true
-RestrictRealtime=true
+
+# Environment Variables (können auch über /etc/default/sentinel-agent geladen werden)
+EnvironmentFile=/etc/default/sentinel-agent
 
 [Install]
 WantedBy=multi-user.target

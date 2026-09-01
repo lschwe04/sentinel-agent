@@ -1,0 +1,53 @@
+---
+- name: Deploy SentinelCore Agent to Customer Nodes
+  hosts: customer_servers
+  become: yes
+  vars:
+    hub_base_url: "https://hub.systemhaus-xy.de/api/v1"
+    enroll_token: "systemhaus-master-secret-token"
+    tenant_id: "systemhaus-xy"
+
+  tasks:
+    - name: Create agent installation directory
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /opt/sentinel-agent
+        - /etc/sentinel/certs
+
+    - name: Copy agent binary
+      copy:
+        src: "../../bin/sentinel-agent"
+        dest: "/opt/sentinel-agent/sentinel-agent"
+        mode: '0755'
+
+    - name: Copy mTLS certificates
+      copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: '0600'
+      loop:
+        - { src: "../../certs/agent.crt", dest: "/etc/sentinel/certs/agent.crt" }
+        - { src: "../../certs/agent.key", dest: "/etc/sentinel/certs/agent.key" }
+        - { src: "../../certs/ca.crt", dest: "/etc/sentinel/certs/ca.crt" }
+
+    - name: Configure agent environment file
+      template:
+        src: "templates/sentinel-agent.env.j2"
+        dest: "/etc/default/sentinel-agent"
+        mode: '0600'
+
+    - name: Copy systemd service file
+      copy:
+        src: "../sentinel-agent.service"
+        dest: "/etc/systemd/system/sentinel-agent.service"
+        mode: '0644'
+
+    - name: Reload systemd and start agent
+      systemd:
+        name: sentinel-agent
+        daemon_reload: yes
+        enabled: yes
+        state: restarted

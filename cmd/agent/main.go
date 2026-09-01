@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -39,14 +40,26 @@ func main() {
 	tenantID := os.Getenv("TENANT_ID")
 	customerID := os.Getenv("CUSTOMER_ID")
 	hubMetricsURL := os.Getenv("HUB_METRICS_URL")
+	hubBaseURL := os.Getenv("HUB_BASE_URL") // Z.B. https://hub.systemhaus.de/api/v1
+	enrollToken := os.Getenv("ENROLL_TOKEN")
 	authToken := os.Getenv("ENTERPRISE_AUTH_TOKEN")
 
-	if nodeID == "" || tenantID == "" || hubMetricsURL == "" || authToken == "" {
-		slog.Error("CRITICAL: Erforderliche Umgebungsvariablen (NODE_ID, TENANT_ID, HUB_METRICS_URL, ENTERPRISE_AUTH_TOKEN) fehlen.")
+	if nodeID == "" || tenantID == "" || customerID == "" || hubMetricsURL == "" || authToken == "" {
+		slog.Error("CRITICAL: Erforderliche Umgebungsvariablen (NODE_ID, TENANT_ID, CUSTOMER_ID, HUB_METRICS_URL, ENTERPRISE_AUTH_TOKEN) fehlen.")
 		os.Exit(1)
 	}
 
-	// Hintergrund-Worker mit Mandanten-Kontext starten
+	// 1. Automatisches Self-Enrollment beim Start ausführen, falls Hub-Base und Token da sind
+	if hubBaseURL != "" && enrollToken != "" {
+		custInt, err := strconv.Atoi(customerID)
+		if err == nil {
+			performAutoEnrollment(hubBaseURL, enrollToken, nodeID, custInt)
+		} else {
+			slog.Warn("CUSTOMER_ID konnte nicht nach Integer geparst werden, überspringe Auto-Enrollment", "customer_id", customerID)
+		}
+	}
+
+	// 2. Hintergrund-Worker mit Mandanten-Kontext starten
 	go startMetricsReporter(nodeID, tenantID, customerID, hubMetricsURL, authToken)
 
 	stop := make(chan os.Signal, 1)
@@ -55,11 +68,42 @@ func main() {
 	slog.Info("Agent wird heruntergefahren...")
 }
 
+// Führt die automatische Registrierung (Enrollment) beim Hub durch
+func performAutoEnrollment(hubBaseURL, enrollToken, nodeID string, customerID int) {
+	enrollPayload := map[string]interface{}{
+		"enroll_token": enrollToken,
+		"node_id":      nodeID,
+		"customer_id":  customerID,
+	}
+
+	data, err := json.Marshal(enrollPayload)
+	if err != nil {
+		slog.Error("Fehler beim Marshalling des Enrollment-Payloads", "error", err)
+		return
+	}
+
+	enrollURL := hubBaseURL + "/enroll"
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	resp, err := client.Post(enrollURL, "application/json", bytes.NewBuffer(data))
+	if err != nil {
+		slog.Warn("Auto-Enrollment Verbindung fehlgeschlagen (wird fortgesetzt)", "error", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		slog.Info("Agent erfolgreich am Hub eingeschrieben (Enrolled)", "node_id", nodeID)
+	} else {
+		slog.Error("Enrollment vom Hub abgelehnt", "status_code", resp.StatusCode)
+	}
+}
+
 func startMetricsReporter(nodeID, tenantID, customerID, hubMetricsURL, authToken string) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	// mTLS Setup wie im Original...
+	// mTLS Setup
 	certPath := os.Getenv("AGENT_CERT_PATH")
 	if certPath == "" {
 		certPath = "/etc/sentinel/certs/agent.crt"
@@ -127,7 +171,7 @@ func startMetricsReporter(nodeID, tenantID, customerID, hubMetricsURL, authToken
 
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+authToken)
-		req.Header.Set("X-Tenant-ID", tenantID) // Übermittelt das Systemhaus direkt im Header
+		req.Header.Set("X-Tenant-ID", tenantID)
 
 		resp, err := client.Do(req)
 		if err == nil {
