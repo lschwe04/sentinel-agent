@@ -14,16 +14,18 @@ import (
 	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
 )
 
-// Erweitert um Tenant- und Customer-Zuordnung für das White-Label-Modell
+// Erweitert um Tenant-, Customer- und Festplatten-Zuordnung für das Enterprise-Modell
 type MetricsPayload struct {
 	NodeID     string  `json:"node_id"`
 	TenantID   string  `json:"tenant_id"`
 	CustomerID string  `json:"customer_id"`
 	CPUUsage   float64 `json:"cpu_usage_pct"`
 	RAMUsage   float64 `json:"ram_usage_pct"`
+	DiskUsage  float64 `json:"disk_usage_pct"`
 	Timestamp  string  `json:"timestamp"`
 }
 
@@ -138,16 +140,25 @@ func startMetricsReporter(nodeID, tenantID, customerID, hubMetricsURL, authToken
 	}
 
 	for range ticker.C {
+		// CPU Auslastung
 		cpuPercentages, _ := cpu.Percent(0, false)
 		var cpuUsage float64 = 0.0
 		if len(cpuPercentages) > 0 {
 			cpuUsage = cpuPercentages[0]
 		}
 
+		// RAM Auslastung
 		vmStat, _ := mem.VirtualMemory()
 		var ramUsage float64 = 0.0
 		if vmStat != nil {
 			ramUsage = vmStat.UsedPercent
+		}
+
+		// Festplatten-Auslastung (Root-Partition)
+		diskStat, err := disk.Usage("/")
+		var diskUsage float64 = 0.0
+		if err == nil && diskStat != nil {
+			diskUsage = diskStat.UsedPercent
 		}
 
 		payload := MetricsPayload{
@@ -156,6 +167,7 @@ func startMetricsReporter(nodeID, tenantID, customerID, hubMetricsURL, authToken
 			CustomerID: customerID,
 			CPUUsage:   cpuUsage,
 			RAMUsage:   ramUsage,
+			DiskUsage:  diskUsage,
 			Timestamp:  time.Now().Format(time.RFC3339),
 		}
 
