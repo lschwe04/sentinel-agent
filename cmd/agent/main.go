@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -56,7 +58,7 @@ func main() {
 		WriteTimeout: 15 * time.Second,
 	}
 
-	// Hintergrund-Worker mit Token starten
+	// Hintergrund-Worker mit mTLS und Token starten
 	go startMetricsReporter(nodeID, hubMetricsURL, authToken)
 
 	stop := make(chan os.Signal, 1)
@@ -77,12 +79,53 @@ func main() {
 	server.Shutdown(ctx)
 }
 
-// Authentifizierter Metrics Reporter mit Exponential-Backoff
+// Authentifizierter Metrics Reporter mit mTLS, Exponential-Backoff und Fail-Safe
 func startMetricsReporter(nodeID, hubMetricsURL, authToken string) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	// --- mTLS Konfiguration (Enterprise Security) ---
+	certPath := os.Getenv("AGENT_CERT_PATH")
+	if certPath == "" {
+		certPath = "/etc/sentinel/certs/agent.crt"
+	}
+	keyPath := os.Getenv("AGENT_KEY_PATH")
+	if keyPath == "" {
+		keyPath = "/etc/sentinel/certs/agent.key"
+	}
+	caPath := os.Getenv("CA_CERT_PATH")
+	if caPath == "" {
+		caPath = "/etc/sentinel/certs/ca.crt"
+	}
+
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		slog.Error("CRITICAL: Konnte mTLS-Schlüsselpaar nicht laden", "path_cert", certPath, "error", err)
+		return
+	}
+
+	caCert, err := os.ReadFile(caPath)
+	if err != nil {
+		slog.Error("CRITICAL: Konnte CA-Zertifikat nicht lesen", "path_ca", caPath, "error", err)
+		return
+	}
+
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      caCertPool,
+		MinVersion:   tls.VersionTLS13, // Erzwingt modernes, sicheres TLS 1.3
+	}
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: tlsConfig,
+		},
+		Timeout: 5 * time.Second,
+	}
+	// -----------------------------------------------
 
 	for range ticker.C {
 		cpuPercentages, err := cpu.Percent(0, false)
