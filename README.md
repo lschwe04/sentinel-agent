@@ -31,3 +31,10 @@ Sentinel Agent ist der leichtgewichtige, hochsichere Node-Agent, der auf Zielser
 1. Binärdatei kompilieren:
    ```bash
    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o sentinel-agent cmd/agent/main.go
+
+Nach /usr/local/bin/ verschieben und Systemd-Service einrichten:
+
+sudo cp sentinel-agent /usr/local/bin/
+sudo cp deployments/systemd/sentinel-agent.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now sentinel-agent.service
