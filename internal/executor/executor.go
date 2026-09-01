@@ -2,12 +2,16 @@ package executor
 
 import (
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"os/exec"
+	"time"
 )
 
 type ExecutionResponse struct {
-	Success bool   `json:"success"`
+	JobID   string `json:"job_id"`
+	Status  string `json:"status"`
 	Message string `json:"message"`
 }
 
@@ -17,22 +21,27 @@ func RunAnsiblePlaybook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ansible Playbook lokal ausführen
-	cmd := exec.Command("ansible-playbook", "/etc/sentinel/playbooks/hardening.yml")
-	err := cmd.Run()
+	jobID := fmt.Sprintf("job-%d", time.Now().UnixNano())
 
-	res := ExecutionResponse{
-		Success: err == nil,
-		Message: "Ansible playbook executed successfully",
-	}
+	// Asynchrone Ausführung verhindert HTTP-Timeouts
+	go func(id string) {
+		slog.Info("Starte asynchronen Härtungsprozess", "job_id", id)
+		cmd := exec.Command("ansible-playbook", "/etc/sentinel/playbooks/hardening.yml")
+
+		if err := cmd.Run(); err != nil {
+			slog.Error("Ansible Härtung fehlgeschlagen", "job_id", id, "error", err)
+			// Hier würde künftig ein Webhook an den Hub den Fehler melden
+			return
+		}
+		slog.Info("Ansible Härtung erfolgreich abgeschlossen", "job_id", id)
+	}(jobID)
 
 	w.Header().Set("Content-Type", "application/json")
-	if err != nil {
-		res.Message = "Execution failed: " + err.Error()
-		w.WriteHeader(http.StatusInternalServerError)
-	} else {
-		w.WriteHeader(http.StatusOK)
-	}
+	w.WriteHeader(http.StatusAccepted) // 202 Accepted statt 200 OK
 
-	json.NewEncoder(w).Encode(res)
+	json.NewEncoder(w).Encode(ExecutionResponse{
+		JobID:   jobID,
+		Status:  "accepted",
+		Message: "Hardening process queued and running in background",
+	})
 }
