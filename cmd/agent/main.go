@@ -18,15 +18,19 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
+	// Dynamische Konfiguration via Env-Variablen (beseitigt Hardcoding)
+	addr := os.Getenv("AGENT_LISTEN_ADDR")
+	if addr == "" {
+		addr = "10.0.0.15:9443" // Fallback für WireGuard
+	}
+
 	mux := http.NewServeMux()
 
-	// Endpunkte mit eingebauter Zero-Trust-Netzwerkvalidierung wrapfen
 	mux.Handle("POST /trigger-ansible", enforceVPN(http.HandlerFunc(executor.RunAnsiblePlaybook)))
 	mux.Handle("GET /backup-status", enforceVPN(http.HandlerFunc(collector.CheckResticStatus)))
 
-	// Bindung erfolgt strikt an die lokale WireGuard-IP (z.B. 10.0.0.15)
 	server := &http.Server{
-		Addr:         "10.0.0.15:9443",
+		Addr:         addr,
 		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 15 * time.Second,
@@ -36,7 +40,7 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		slog.Info("Sentinel Agent gestartet auf WireGuard Interface", "addr", server.Addr)
+		slog.Info("Sentinel Agent gestartet", "addr", server.Addr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("Agent Server abgestürzt", "error", err)
 			os.Exit(1)
@@ -50,7 +54,6 @@ func main() {
 	server.Shutdown(ctx)
 }
 
-// Middleware: Erzwingt, dass Requests nur aus dem WireGuard-Netzwerk kommen
 func enforceVPN(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := network.ValidateVPNConnection(r.RemoteAddr); err != nil {
