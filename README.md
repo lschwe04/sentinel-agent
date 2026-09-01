@@ -14,3 +14,14 @@ Use the provided Ansible playbook to roll out the agent across hundreds of custo
 
 ```bash
 ansible-playbook -i inventory.ini install-agent.yml
+
+🛠️ Environment Variables
+Configure the agent via /etc/default/sentinel-agent:
+
+NODE_ID: Unique identifier for the host
+
+TENANT_ID: System house identifier
+
+CUSTOMER_ID: End-customer database ID
+
+HUB_BASE_URL: Endpoint of the central hub
