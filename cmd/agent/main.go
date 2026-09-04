@@ -46,7 +46,7 @@ func main() {
 
 	// 1. Lokalen Disk-Buffer initialisieren (Sicherheit Nr. 1 & Skalierung Nr. 2)
 	bufferPath := filepath.Join(getEnvOrDefault("AGENT_STATE_DIR", "/var/lib/sentinel"), "buffer.dat")
-	diskBuffer, err := buffer.NewDiskBuffer(bufferPath, 10000) // Puffsert bis zu 10.000 Events
+	diskBuffer, err := buffer.NewDiskBuffer(bufferPath, 10000, nil)
 	if err != nil {
 		slog.Error("Konnte lokalen Disk-Buffer nicht initialisieren", "error", err)
 		os.Exit(1)
