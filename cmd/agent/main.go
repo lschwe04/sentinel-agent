@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,7 +20,6 @@ import (
 	"github.com/shirou/gopsutil/v3/mem"
 )
 
-// Erweitert um Tenant-, Customer- und Festplatten-Zuordnung für das Enterprise-Modell
 type MetricsPayload struct {
 	NodeID     string  `json:"node_id"`
 	TenantID   string  `json:"tenant_id"`
@@ -33,45 +34,41 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
-	addr := os.Getenv("AGENT_LISTEN_ADDR")
-	if addr == "" {
-		addr = "10.0.0.15:9443"
-	}
-
 	nodeID := os.Getenv("NODE_ID")
 	tenantID := os.Getenv("TENANT_ID")
 	customerID := os.Getenv("CUSTOMER_ID")
 	hubMetricsURL := os.Getenv("HUB_METRICS_URL")
-	hubBaseURL := os.Getenv("HUB_BASE_URL") // Z.B. https://hub.systemhaus.de/api/v1
+	hubBaseURL := os.Getenv("HUB_BASE_URL")
 	enrollToken := os.Getenv("ENROLL_TOKEN")
 	authToken := os.Getenv("ENTERPRISE_AUTH_TOKEN")
 
-	if nodeID == "" || tenantID == "" || customerID == "" || hubMetricsURL == "" || authToken == "" {
-		slog.Error("CRITICAL: Erforderliche Umgebungsvariablen (NODE_ID, TENANT_ID, CUSTOMER_ID, HUB_METRICS_URL, ENTERPRISE_AUTH_TOKEN) fehlen.")
+	if nodeID == "" || tenantID == "" || customerID == "" || hubMetricsURL == "" {
+		slog.Error("CRITICAL: Erforderliche Umgebungsvariablen (NODE_ID, TENANT_ID, CUSTOMER_ID, HUB_METRICS_URL) fehlen.")
 		os.Exit(1)
 	}
 
-	// 1. Automatisches Self-Enrollment beim Start ausführen, falls Hub-Base und Token da sind
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// 1. Automatisches Self-Enrollment beim Start
 	if hubBaseURL != "" && enrollToken != "" {
 		custInt, err := strconv.Atoi(customerID)
 		if err == nil {
-			performAutoEnrollment(hubBaseURL, enrollToken, nodeID, custInt)
+			performAutoEnrollment(ctx, hubBaseURL, enrollToken, nodeID, custInt)
 		} else {
-			slog.Warn("CUSTOMER_ID konnte nicht nach Integer geparst werden, überspringe Auto-Enrollment", "customer_id", customerID)
+			slog.Warn("CUSTOMER_ID ist kein gültiger Integer, überspringe Auto-Enrollment", "customer_id", customerID)
 		}
 	}
 
-	// 2. Hintergrund-Worker mit Mandanten-Kontext starten
-	go startMetricsReporter(nodeID, tenantID, customerID, hubMetricsURL, authToken)
+	// 2. Hintergrund-Worker mit Context-Steuerung starten
+	go startMetricsReporter(ctx, nodeID, tenantID, customerID, hubMetricsURL, authToken)
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
-	slog.Info("Agent wird heruntergefahren...")
+	slog.Info("Sentinel Agent erfolgreich gestartet", "node_id", nodeID, "tenant_id", tenantID)
+	<-ctx.Done()
+	slog.Info("Agent wird geordnet heruntergefahren...")
 }
 
-// Führt die automatische Registrierung (Enrollment) beim Hub durch
-func performAutoEnrollment(hubBaseURL, enrollToken, nodeID string, customerID int) {
+func performAutoEnrollment(ctx context.Context, hubBaseURL, enrollToken, nodeID string, customerID int) {
 	enrollPayload := map[string]interface{}{
 		"enroll_token": enrollToken,
 		"node_id":      nodeID,
@@ -84,10 +81,15 @@ func performAutoEnrollment(hubBaseURL, enrollToken, nodeID string, customerID in
 		return
 	}
 
-	enrollURL := hubBaseURL + "/enroll"
-	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, hubBaseURL+"/enroll", bytes.NewBuffer(data))
+	if err != nil {
+		slog.Error("Konnte Enrollment Request nicht erstellen", "error", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Post(enrollURL, "application/json", bytes.NewBuffer(data))
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		slog.Warn("Auto-Enrollment Verbindung fehlgeschlagen (wird fortgesetzt)", "error", err)
 		return
@@ -95,40 +97,113 @@ func performAutoEnrollment(hubBaseURL, enrollToken, nodeID string, customerID in
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK {
-		slog.Info("Agent erfolgreich am Hub eingeschrieben (Enrolled)", "node_id", nodeID)
+		slog.Info("Agent erfolgreich am Hub eingeschrieben", "node_id", nodeID)
 	} else {
 		slog.Error("Enrollment vom Hub abgelehnt", "status_code", resp.StatusCode)
 	}
 }
 
-func startMetricsReporter(nodeID, tenantID, customerID, hubMetricsURL, authToken string) {
+func startMetricsReporter(ctx context.Context, nodeID, tenantID, customerID, hubMetricsURL, authToken string) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	// mTLS Setup
-	certPath := os.Getenv("AGENT_CERT_PATH")
-	if certPath == "" {
-		certPath = "/etc/sentinel/certs/agent.crt"
+	client, err := createMTLSClient()
+	if err != nil {
+		slog.Error("Sicherer mTLS Client konnte nicht initialisiert werden. Metrik-Reporter wird gestoppt.", "error", err)
+		return
 	}
-	keyPath := os.Getenv("AGENT_KEY_PATH")
-	if keyPath == "" {
-		keyPath = "/etc/sentinel/certs/agent.key"
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("Metrik-Reporter beendet.")
+			return
+		case <-ticker.C:
+			reportMetrics(ctx, client, nodeID, tenantID, customerID, hubMetricsURL, authToken)
+		}
 	}
-	caPath := os.Getenv("CA_CERT_PATH")
-	if caPath == "" {
-		caPath = "/etc/sentinel/certs/ca.crt"
+}
+
+func reportMetrics(ctx context.Context, client *http.Client, nodeID, tenantID, customerID, hubMetricsURL, authToken string) {
+	cpuPercentages, err := cpu.PercentWithContext(ctx, 0, false)
+	var cpuUsage float64 = 0.0
+	if err == nil && len(cpuPercentages) > 0 {
+		cpuUsage = cpuPercentages[0]
 	}
+
+	vmStat, err := mem.VirtualMemoryWithContext(ctx)
+	var ramUsage float64 = 0.0
+	if err == nil && vmStat != nil {
+		ramUsage = vmStat.UsedPercent
+	}
+
+	diskStat, err := disk.UsageWithContext(ctx, "/")
+	var diskUsage float64 = 0.0
+	if err == nil && diskStat != nil {
+		diskUsage = diskStat.UsedPercent
+	}
+
+	payload := MetricsPayload{
+		NodeID:     nodeID,
+		TenantID:   tenantID,
+		CustomerID: customerID,
+		CPUUsage:   cpuUsage,
+		RAMUsage:   ramUsage,
+		DiskUsage:  diskUsage,
+		Timestamp:  time.Now().Format(time.RFC3339),
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		slog.Error("Fehler beim Serialisieren der Metriken", "error", err)
+		return
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, hubMetricsURL, bytes.NewBuffer(data))
+	if err != nil {
+		slog.Error("Fehler beim Erstellen des Metrik-Requests", "error", err)
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
+	req.Header.Set("X-Tenant-ID", tenantID)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		slog.Error("Fehler beim Übertragen der Metriken an den Hub", "error", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		slog.Warn("Hub hat Metrik-Übertragung abgelehnt", "status_code", resp.StatusCode)
+	}
+}
+
+func createMTLSClient() (*http.Client, error) {
+	certPath := getEnvOrDefault("AGENT_CERT_PATH", "/etc/sentinel/certs/agent.crt")
+	keyPath := getEnvOrDefault("AGENT_KEY_PATH", "/etc/sentinel/certs/agent.key")
+	caPath := getEnvOrDefault("CA_CERT_PATH", "/etc/sentinel/certs/ca.crt")
 
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		slog.Error("Konnte mTLS-Schlüsselpaar nicht laden", "error", err)
-		return
+		return nil, fmt.Errorf("mTLS KeyPair Ladefehler: %w", err)
 	}
-	caCert, _ := os.ReadFile(caPath)
-	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
 
-	client := &http.Client{
+	caCert, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil, fmt.Errorf("CA Zertifikat Ladefehler: %w", err)
+	}
+
+	caCertPool := x509.NewCertPool()
+	if !caCertPool.AppendCertsFromPEM(caCert) {
+		return nil, fmt.Errorf("konnte CA Zertifikat nicht zum Pool hinzufügen")
+	}
+
+	return &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
 				Certificates: []tls.Certificate{cert},
@@ -136,58 +211,13 @@ func startMetricsReporter(nodeID, tenantID, customerID, hubMetricsURL, authToken
 				MinVersion:   tls.VersionTLS13,
 			},
 		},
-		Timeout: 5 * time.Second,
+		Timeout: 10 * time.Second,
+	}, nil
+}
+
+func getEnvOrDefault(key, defaultValue string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
 	}
-
-	for range ticker.C {
-		// CPU Auslastung
-		cpuPercentages, _ := cpu.Percent(0, false)
-		var cpuUsage float64 = 0.0
-		if len(cpuPercentages) > 0 {
-			cpuUsage = cpuPercentages[0]
-		}
-
-		// RAM Auslastung
-		vmStat, _ := mem.VirtualMemory()
-		var ramUsage float64 = 0.0
-		if vmStat != nil {
-			ramUsage = vmStat.UsedPercent
-		}
-
-		// Festplatten-Auslastung (Root-Partition)
-		diskStat, err := disk.Usage("/")
-		var diskUsage float64 = 0.0
-		if err == nil && diskStat != nil {
-			diskUsage = diskStat.UsedPercent
-		}
-
-		payload := MetricsPayload{
-			NodeID:     nodeID,
-			TenantID:   tenantID,
-			CustomerID: customerID,
-			CPUUsage:   cpuUsage,
-			RAMUsage:   ramUsage,
-			DiskUsage:  diskUsage,
-			Timestamp:  time.Now().Format(time.RFC3339),
-		}
-
-		data, err := json.Marshal(payload)
-		if err != nil {
-			continue
-		}
-
-		req, err := http.NewRequest(http.MethodPost, hubMetricsURL, bytes.NewBuffer(data))
-		if err != nil {
-			continue
-		}
-
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+authToken)
-		req.Header.Set("X-Tenant-ID", tenantID)
-
-		resp, err := client.Do(req)
-		if err == nil {
-			resp.Body.Close()
-		}
-	}
+	return defaultValue
 }

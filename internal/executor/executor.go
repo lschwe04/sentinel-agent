@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -34,26 +35,27 @@ func RunAnsiblePlaybook(w http.ResponseWriter, r *http.Request) {
 
 	jobID := fmt.Sprintf("job-%d", time.Now().UnixNano())
 
-	// Asynchrone Ausführung des Härtungsprozesses
 	go func(id string) {
-		slog.Info("Starte asynchronen Härtungsprozess", "job_id", id)
-		cmd := exec.Command("ansible-playbook", "/etc/sentinel/playbooks/hardening.yml")
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		defer cancel()
 
-		err := cmd.Run()
+		slog.Info("Starte asynchronen Härtungsprozess", "job_id", id)
+		cmd := exec.CommandContext(ctx, "/usr/bin/ansible-playbook", "/etc/sentinel/playbooks/hardening.yml")
+
+		output, err := cmd.CombinedOutput()
 		success := true
 		msg := "Hardening successfully applied"
 		openIssues := 0
 
 		if err != nil {
-			slog.Error("Ansible Härtung fehlgeschlagen", "job_id", id, "error", err)
+			slog.Error("Ansible Härtung fehlgeschlagen", "job_id", id, "error", err, "output", string(output))
 			success = false
-			msg = err.Error()
+			msg = fmt.Sprintf("Execution error: %v", err)
 			openIssues = 3
 		} else {
 			slog.Info("Ansible Härtung erfolgreich abgeschlossen", "job_id", id)
 		}
 
-		// Closed-Loop: Status direkt per mTLS an den Hub melden
 		reportBackToHub(success, msg, openIssues)
 	}(jobID)
 
@@ -69,11 +71,11 @@ func RunAnsiblePlaybook(w http.ResponseWriter, r *http.Request) {
 func reportBackToHub(success bool, message string, openIssues int) {
 	hubURL := os.Getenv("HUB_CALLBACK_URL")
 	if hubURL == "" {
-		hubURL = "https://sentinel-hub:8443/api/v1/hardening/report"
+		hubURL = "https://10.0.0.1:8443/api/v1/hardening/report"
 	}
 	nodeID := os.Getenv("NODE_ID")
 	if nodeID == "" {
-		nodeID = "node-local-docker"
+		nodeID = "unknown-node"
 	}
 
 	report := HardeningReport{
@@ -89,13 +91,29 @@ func reportBackToHub(success bool, message string, openIssues int) {
 		return
 	}
 
-	// mTLS Client Konfiguration für sicheren Callback
-	cert, err := tls.LoadX509KeyPair("/etc/sentinel/certs/agent.crt", "/etc/sentinel/certs/agent.key")
+	certPath := os.Getenv("AGENT_CERT_PATH")
+	if certPath == "" {
+		certPath = "/etc/sentinel/certs/agent.crt"
+	}
+	keyPath := os.Getenv("AGENT_KEY_PATH")
+	if keyPath == "" {
+		keyPath = "/etc/sentinel/certs/agent.key"
+	}
+	caPath := os.Getenv("CA_CERT_PATH")
+	if caPath == "" {
+		caPath = "/etc/sentinel/certs/ca.crt"
+	}
+
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
 		slog.Error("mTLS Zertifikat Fehler beim Callback", "error", err)
 		return
 	}
-	caCert, _ := os.ReadFile("/etc/sentinel/certs/ca.crt")
+	caCert, err := os.ReadFile(caPath)
+	if err != nil {
+		slog.Error("CA Zertifikat Ladefehler beim Callback", "error", err)
+		return
+	}
 	caCertPool := x509.NewCertPool()
 	caCertPool.AppendCertsFromPEM(caCert)
 
@@ -107,7 +125,7 @@ func reportBackToHub(success bool, message string, openIssues int) {
 				MinVersion:   tls.VersionTLS13,
 			},
 		},
-		Timeout: 5 * time.Second,
+		Timeout: 10 * time.Second,
 	}
 
 	req, err := http.NewRequest(http.MethodPost, hubURL, bytes.NewBuffer(data))
@@ -123,5 +141,6 @@ func reportBackToHub(success bool, message string, openIssues int) {
 		return
 	}
 	defer resp.Body.Close()
+
 	slog.Info("Hardening-Status erfolgreich an Hub gemeldet", "status_code", resp.StatusCode)
 }

@@ -1,37 +1,41 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# Überprüfe Root-Rechte
 if [ "$EUID" -ne 0 ]; then
-  echo "[-] Bitte als Root ausführen (sudo bash install.sh)."
+  echo "[-] Fehler: Bitte als Root ausführen (sudo bash install.sh)."
   exit 1
 fi
 
 echo "[+] Starte Sentinel-Agent Installation..."
 
-# Variablen aus Umgebung oder Parametern
 HUB_BASE_URL="${HUB_BASE_URL:-https://hub.yourdomain.com}"
-ENROLL_TOKEN="${ENROLL_TOKEN}"
-TENANT_ID="${TENANT_ID}"
-CUSTOMER_ID="${CUSTOMER_ID}"
+ENROLL_TOKEN="${ENROLL_TOKEN:-}"
+TENANT_ID="${TENANT_ID:-}"
+CUSTOMER_ID="${CUSTOMER_ID:-}"
 NODE_ID="${NODE_ID:-$(hostname)}"
 
 if [ -z "$ENROLL_TOKEN" ] || [ -z "$TENANT_ID" ] || [ -z "$CUSTOMER_ID" ]; then
-  echo "[-] Fehler: ENROLL_TOKEN, TENANT_ID und CUSTOMER_ID müssen gesetzt sein."
-  echo "Beispiel: TENANT=haus CUSTOMER=1 TOKEN=xyz bash install.sh"
+  echo "[-] Fehler: Die Variablen ENROLL_TOKEN, TENANT_ID und CUSTOMER_ID müssen gesetzt sein."
+  echo "Beispiel: TENANT_ID=systemhaus-xy CUSTOMER_ID=1 ENROLL_TOKEN=xyz bash install.sh"
   exit 1
 fi
 
-# 1. Verzeichnisse anlegen
-mkdir -p /etc/sentinel/certs
-mkdir -p /opt/sentinel
+mkdir -p /etc/sentinel/certs /opt/sentinel /etc/default
 
-# 2. Binary herunterladen (Platzhalter für deine Build-Pipeline)
-echo "[+] Lade Agent-Binary herunter..."
-# curl -sSL -o /opt/sentinel/sentinel-agent https://yourdomain.com/downloads/sentinel-agent
-# chmod +x /opt/sentinel/sentinel-agent
+cat << EOF > /etc/default/sentinel-agent
+NODE_ID=${NODE_ID}
+TENANT_ID=${TENANT_ID}
+CUSTOMER_ID=${CUSTOMER_ID}
+HUB_BASE_URL=${HUB_BASE_URL}
+ENROLL_TOKEN=${ENROLL_TOKEN}
+HUB_METRICS_URL=${HUB_BASE_URL}/api/v1/metrics
+AGENT_CERT_PATH=/etc/sentinel/certs/agent.crt
+AGENT_KEY_PATH=/etc/sentinel/certs/agent.key
+CA_CERT_PATH=/etc/sentinel/certs/ca.crt
+EOF
 
-# 3. Systemd Service mit Hardening anlegen
+chmod 600 /etc/default/sentinel-agent
+
 cat << EOF > /etc/systemd/system/sentinel-agent.service
 [Unit]
 Description=SentinelCore Enterprise Security & Telemetry Agent
@@ -40,31 +44,25 @@ After=network.target
 [Service]
 Type=simple
 User=root
+WorkingDirectory=/opt/sentinel
 ExecStart=/opt/sentinel/sentinel-agent
 Restart=always
 RestartSec=10
 
-# Hardening / Sandboxing
 ProtectSystem=strict
 ProtectHome=true
 NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
 MemoryDenyWriteExecute=true
 
-Environment=NODE_ID=${NODE_ID}
-Environment=TENANT_ID=${TENANT_ID}
-Environment=CUSTOMER_ID=${CUSTOMER_ID}
-Environment=HUB_BASE_URL=${HUB_BASE_URL}
-Environment=ENROLL_TOKEN=${ENROLL_TOKEN}
-Environment=HUB_METRICS_URL=${HUB_BASE_URL}/api/v1/metrics
-Environment=ENTERPRISE_AUTH_TOKEN=${ENROLL_TOKEN}
+EnvironmentFile=/etc/default/sentinel-agent
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# 4. Systemd neu laden und Dienst starten
 systemctl daemon-reload
 systemctl enable sentinel-agent
-systemctl restart sentinel-agent
-
-echo "[+] Sentinel-Agent erfolgreich installiert und gestartet! Node-ID: ${NODE_ID}"
+echo "[+] Sentinel-Agent erfolgreich eingerichtet! Starte den Service nach Platzieren der mTLS Zertifikate mit: systemctl start sentinel-agent"
