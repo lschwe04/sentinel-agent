@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -27,12 +28,14 @@ type MetricPayload struct {
 
 type DiskBuffer struct {
 	mu           sync.Mutex
+	flushMu      sync.Mutex
 	filePath     string
 	maxSize      int
 	maxFileBytes int64
 	aesKey       []byte
 	queue        []MetricPayload
 	diskOnly     bool
+	closed       bool
 }
 
 const defaultMaxFileBytes int64 = 10 * 1024 * 1024
@@ -74,6 +77,9 @@ func NewDiskBufferWithLimits(storagePath string, maxSize int, maxFileBytes int64
 func (b *DiskBuffer) Enqueue(eventType string, data any) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.closed {
+		return errors.New("buffer is closed")
+	}
 	if err := b.ensureLoadedLocked(); err != nil {
 		return err
 	}
@@ -109,10 +115,31 @@ func (b *DiskBuffer) Sync() error {
 	return b.persistToDiskLocked()
 }
 
+// Close durably persists the queue and prevents writes after shutdown.
+func (b *DiskBuffer) Close() error {
+	b.flushMu.Lock()
+	defer b.flushMu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return nil
+	}
+	if !b.diskOnly {
+		if err := b.persistToDiskLocked(); err != nil {
+			return err
+		}
+	}
+	b.closed = true
+	return nil
+}
+
 // ReleaseMemoryToDisk keeps the durable queue on disk and releases its in-memory copy.
 func (b *DiskBuffer) ReleaseMemoryToDisk() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.closed {
+		return errors.New("buffer is closed")
+	}
 	if b.diskOnly {
 		return nil
 	}
@@ -126,7 +153,14 @@ func (b *DiskBuffer) ReleaseMemoryToDisk() error {
 
 // FlushCompress (Ihr genialer Code bleibt erhalten!)
 func (b *DiskBuffer) FlushCompress(ctx context.Context, sendFunc func(ctx context.Context, compressedGzip []byte) error) error {
+	b.flushMu.Lock()
+	defer b.flushMu.Unlock()
+
 	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return errors.New("buffer is closed")
+	}
 	if err := b.ensureLoadedLocked(); err != nil {
 		b.mu.Unlock()
 		return err
@@ -182,8 +216,9 @@ func (b *DiskBuffer) persistToDiskLocked() error {
 		return err
 	}
 
-	for len(b.queue) > 0 {
-		rawJSON, err := json.Marshal(b.queue)
+	candidate := b.queue
+	for len(candidate) > 0 {
+		rawJSON, err := json.Marshal(candidate)
 		if err != nil {
 			return err
 		}
@@ -193,11 +228,15 @@ func (b *DiskBuffer) persistToDiskLocked() error {
 				return err
 			}
 			ciphertext := gcm.Seal(nonce, nonce, rawJSON, nil)
-			return b.writeAtomically(ciphertext)
+			if err := b.writeAtomically(ciphertext); err != nil {
+				return err
+			}
+			b.queue = candidate
+			return nil
 		}
 
 		slog.Warn("Disk-Buffer-Limit erreicht; ältestes Ereignis verworfen", "component", "buffer", "max_file_bytes", b.maxFileBytes)
-		b.queue = b.queue[1:]
+		candidate = candidate[1:]
 	}
 
 	if err := os.Remove(b.filePath); err != nil && !os.IsNotExist(err) {
@@ -210,15 +249,49 @@ func (b *DiskBuffer) persistToDiskLocked() error {
 }
 
 func (b *DiskBuffer) writeAtomically(ciphertext []byte) error {
-	tmpFile := b.filePath + ".tmp"
-	if err := os.WriteFile(tmpFile, ciphertext, 0600); err != nil {
+	directory := filepath.Dir(b.filePath)
+	tmp, err := os.CreateTemp(directory, filepath.Base(b.filePath)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tmpFile := tmp.Name()
+	defer os.Remove(tmpFile)
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	for written := 0; written < len(ciphertext); {
+		n, writeErr := tmp.Write(ciphertext[written:])
+		written += n
+		if writeErr != nil {
+			_ = tmp.Close()
+			return writeErr
+		}
+		if n == 0 {
+			_ = tmp.Close()
+			return io.ErrShortWrite
+		}
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpFile, b.filePath); err != nil {
-		_ = os.Remove(tmpFile)
 		return err
 	}
-	return nil
+	dir, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil && runtime.GOOS != "windows" {
+		return syncErr
+	}
+	return closeErr
 }
 
 // NEU: Entschlüsseltes Laden von der Festplatte

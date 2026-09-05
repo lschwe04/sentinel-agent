@@ -11,7 +11,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -62,6 +64,9 @@ func (u *Updater) Apply(ctx context.Context, manifestURL string) error {
 	}
 	if manifest.BinaryURL == "" || manifest.Checksum == "" || manifest.Signature == "" {
 		return fmt.Errorf("update manifest is incomplete")
+	}
+	if manifest.Version == "" {
+		return fmt.Errorf("update manifest version is empty")
 	}
 	tmpFile, err := downloadBinary(ctx, u.client, manifest.BinaryURL, u.headers)
 	if err != nil {
@@ -193,6 +198,9 @@ func atomicReplace(src, dst string) error {
 	if err := tmpDst.Chmod(0755); err != nil {
 		return err
 	}
+	if err := tmpDst.Sync(); err != nil {
+		return err
+	}
 	if err := tmpDst.Close(); err != nil {
 		return err
 	}
@@ -200,5 +208,27 @@ func atomicReplace(src, dst string) error {
 		return err
 	}
 	cleanup = false
+	directory, err := os.Open(filepath.Dir(dst))
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if syncErr != nil && runtime.GOOS != "windows" {
+		return syncErr
+	}
+	return closeErr
+}
+
+// RestartService asks systemd to start the newly installed binary.
+func RestartService(ctx context.Context, serviceName string) error {
+	if serviceName == "" {
+		return fmt.Errorf("service name is empty")
+	}
+	command := exec.CommandContext(ctx, "systemctl", "restart", serviceName)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("systemd restart failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
 	return nil
 }

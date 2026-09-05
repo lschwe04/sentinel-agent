@@ -20,6 +20,11 @@ type ReverseTunnel struct {
 	KnownHostsPath string
 }
 
+const (
+	initialReconnectBackoff = time.Second
+	maxReconnectBackoff     = 5 * time.Minute
+)
+
 func NewReverseTunnel(hubAddr, localAddr string, remotePort int, privKeyPath string) *ReverseTunnel {
 	return &ReverseTunnel{
 		HubSSHAddr:     hubAddr,
@@ -54,36 +59,67 @@ func (t *ReverseTunnel) Start(ctx context.Context) {
 		slog.Error("SSH-Tunnel wird aus Sicherheitsgründen abgebrochen: Known-Hosts-Datei fehlt")
 		return
 	}
+	knownHostsInfo, err := os.Stat(t.KnownHostsPath)
+	if err != nil || !knownHostsInfo.Mode().IsRegular() {
+		slog.Error("SSH-Tunnel wird aus Sicherheitsgründen abgebrochen: Known-Hosts-Datei ist nicht verfügbar", "path", t.KnownHostsPath, "error", err)
+		return
+	}
 	config.HostKeyCallback, err = knownhosts.New(t.KnownHostsPath)
 	if err != nil {
 		slog.Error("Known-Hosts-Datei für SSH-Tunnel konnte nicht geladen werden", "error", err)
 		return
 	}
 
+	backoff := initialReconnectBackoff
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			t.establishConnection(config)
-			slog.Warn("Tunnel-Verbindung abgebrochen. Versuche Reconnect in 10 Sekunden...")
-			time.Sleep(10 * time.Second)
+			connected := t.establishConnection(ctx, config)
+			if connected {
+				backoff = initialReconnectBackoff
+			} else {
+				slog.Warn("Tunnel-Verbindung abgebrochen; Reconnect wird geplant", "backoff", backoff)
+			}
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			if !connected && backoff < maxReconnectBackoff {
+				backoff *= 2
+				if backoff > maxReconnectBackoff {
+					backoff = maxReconnectBackoff
+				}
+			}
 		}
 	}
 }
 
-func (t *ReverseTunnel) establishConnection(config *ssh.ClientConfig) {
-	client, err := ssh.Dial("tcp", t.HubSSHAddr, config)
+func (t *ReverseTunnel) establishConnection(ctx context.Context, config *ssh.ClientConfig) bool {
+	client, err := dialSSHContext(ctx, t.HubSSHAddr, config)
 	if err != nil {
 		slog.Error("SSH Dial fehlgeschlagen", "error", err)
-		return
+		return false
 	}
 	defer client.Close()
+	stopClose := make(chan struct{})
+	defer close(stopClose)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = client.Close()
+		case <-stopClose:
+		}
+	}()
 
 	remoteListener, err := client.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", t.RemotePort))
 	if err != nil {
 		slog.Error("Remote Port Forwarding fehlgeschlagen", "port", t.RemotePort, "error", err)
-		return
+		return false
 	}
 	defer remoteListener.Close()
 
@@ -92,21 +128,49 @@ func (t *ReverseTunnel) establishConnection(config *ssh.ClientConfig) {
 	for {
 		remoteConn, err := remoteListener.Accept()
 		if err != nil {
-			slog.Error("Fehler bei Tunnel-Accept", "error", err)
+			if ctx.Err() == nil {
+				slog.Error("Fehler bei Tunnel-Accept", "error", err)
+			}
 			break
 		}
-		go t.forwardLocal(remoteConn)
+		go t.forwardLocal(ctx, remoteConn)
 	}
+	return ctx.Err() == nil
 }
 
-func (t *ReverseTunnel) forwardLocal(remoteConn net.Conn) {
-	localConn, err := net.Dial("tcp", t.LocalAddr)
+func dialSSHContext(ctx context.Context, address string, config *ssh.ClientConfig) (*ssh.Client, error) {
+	dialer := net.Dialer{Timeout: config.Timeout}
+	rawConn, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return nil, err
+	}
+	conn, channels, requests, err := ssh.NewClientConn(rawConn, address, config)
+	if err != nil {
+		_ = rawConn.Close()
+		return nil, err
+	}
+	return ssh.NewClient(conn, channels, requests), nil
+}
+
+func (t *ReverseTunnel) forwardLocal(ctx context.Context, remoteConn net.Conn) {
+	dialer := net.Dialer{}
+	localConn, err := dialer.DialContext(ctx, "tcp", t.LocalAddr)
 	if err != nil {
 		slog.Error("Lokaler Service nicht erreichbar", "addr", t.LocalAddr, "error", err)
 		remoteConn.Close()
 		return
 	}
 
+	stopClose := make(chan struct{})
+	defer close(stopClose)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = localConn.Close()
+			_ = remoteConn.Close()
+		case <-stopClose:
+		}
+	}()
 	go copyConn(localConn, remoteConn)
 	go copyConn(remoteConn, localConn)
 }

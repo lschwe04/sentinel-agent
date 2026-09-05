@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -139,5 +140,74 @@ func TestDiskBufferRejectsWrongKeyOnRestore(t *testing.T) {
 	wrongKey := []byte("abcdefghijklmnopqrstuvwxyz123456")
 	if _, err := NewDiskBuffer(path, 10, wrongKey); err == nil {
 		t.Fatal("expected wrong key to prevent restoring encrypted data")
+	}
+}
+
+func TestDiskBufferRejectsCorruptFileOnRestore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "buffer.dat")
+	key := []byte("01234567890123456789012345678901")
+	if err := os.WriteFile(path, []byte("corrupt"), 0600); err != nil {
+		t.Fatalf("write corrupt buffer: %v", err)
+	}
+	if _, err := NewDiskBuffer(path, 10, key); err == nil {
+		t.Fatal("expected corrupt buffer to be rejected")
+	}
+}
+
+func TestDiskBufferClosePersistsAndRejectsWrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "buffer.dat")
+	key := []byte("01234567890123456789012345678901")
+	buf, err := NewDiskBuffer(path, 10, key)
+	if err != nil {
+		t.Fatalf("create buffer: %v", err)
+	}
+	if err := buf.Enqueue("demo", "before-close"); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := buf.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := buf.Enqueue("demo", "after-close"); err == nil {
+		t.Fatal("expected enqueue after close to fail")
+	}
+	restarted, err := NewDiskBuffer(path, 10, key)
+	if err != nil {
+		t.Fatalf("restore after close: %v", err)
+	}
+	if len(restarted.queue) != 1 {
+		t.Fatalf("expected one persisted item, got %d", len(restarted.queue))
+	}
+}
+
+func TestDiskBufferSerializesConcurrentFlushes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "buffer.dat")
+	key := []byte("01234567890123456789012345678901")
+	buf, err := NewDiskBuffer(path, 10, key)
+	if err != nil {
+		t.Fatalf("create buffer: %v", err)
+	}
+	if err := buf.Enqueue("demo", "once"); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	var wait sync.WaitGroup
+	var calls int
+	var callsMu sync.Mutex
+	flush := func() {
+		defer wait.Done()
+		if err := buf.FlushCompress(context.Background(), func(context.Context, []byte) error {
+			callsMu.Lock()
+			calls++
+			callsMu.Unlock()
+			return nil
+		}); err != nil {
+			t.Errorf("flush: %v", err)
+		}
+	}
+	wait.Add(2)
+	go flush()
+	go flush()
+	wait.Wait()
+	if calls != 1 {
+		t.Fatalf("expected one send for one queue item, got %d", calls)
 	}
 }

@@ -97,9 +97,7 @@ func StartResilientReporter(ctx context.Context, _ *http.Client, reportFunc func
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			go func() {
-				_ = executeWithRetry(ctx, reportFunc, 3, time.Second)
-			}()
+			_ = executeWithRetry(ctx, reportFunc, 3, time.Second)
 		}
 	}
 }

@@ -17,6 +17,10 @@ type Server struct {
 }
 
 func Start(ctx context.Context, path string) (*Server, error) {
+	return StartWithHandlers(ctx, path, nil)
+}
+
+func StartWithHandlers(ctx context.Context, path string, handlers map[string]http.HandlerFunc) (*Server, error) {
 	if path == "" {
 		return nil, fmt.Errorf("diagnostic socket path is empty")
 	}
@@ -39,6 +43,11 @@ func Start(ctx context.Context, path string) (*Server, error) {
 	mux.Handle("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
 	mux.Handle("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
 	mux.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
+	for route, handler := range handlers {
+		if route != "" && handler != nil {
+			mux.HandleFunc(route, handler)
+		}
+	}
 	server := &Server{server: &http.Server{Handler: mux}, path: path}
 	go func() {
 		if err := server.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {

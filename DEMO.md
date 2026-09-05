@@ -87,6 +87,13 @@ Die Tests prüfen unter anderem AES-256-Schlüssellänge, Persistenz/Wiederherst
 
 5. Für den Live-Nachweis trenne drei Szenen: erfolgreicher mTLS-Telemetrieversand, kurzzeitiger Hub-Ausfall mit Buffer-Aufbau und Wiederanbindung mit anschließendem Flush. Niemals den Demo-HTTP-Modus oder Testschlüssel in Kundensystemen verwenden.
 
-## Bekannte bewusste Grenzen
+## Beta-Konfiguration
 
-Remote-Hardening, Reverse-SSH-Tunnel und signierte Self-Updates sind nicht Teil des lokalen Demo-Pfads. Diese Funktionen benötigen einen produktiven Hub-Vertrag, eine Host-Key-/Signaturverwaltung und eine definierte Freigabe-Policy; sie sollten nicht mit Mock-Daten vorgeführt werden.
+Remote-Hardening, Reverse-SSH-Tunnel und signierte Self-Updates sind nicht Teil des lokalen Demo-Pfads. Für den Beta-Betrieb gelten mindestens diese Einstellungen:
+
+- `REMOTE_HARDENING_HMAC_SECRET` aktiviert signierte Hardening-Aufträge. Signiert wird der feste Payload `/usr/bin/ansible-playbook /etc/sentinel/playbooks/hardening.yml`; beliebige Request-Kommandos werden nicht ausgeführt.
+- `AGENT_FIM_PATHS` enthält eine komma-getrennte Liste kritischer Dateien. FIM-Alarme werden vor regulären Metriken an den verschlüsselten Buffer übergeben und priorisiert übertragen.
+- `AGENT_SSH_KNOWN_HOSTS` muss auf eine vorhandene Known-Hosts-Datei zeigen. Der Reverse-Tunnel verwendet Host-Key-Prüfung und exponentielles Reconnect-Backoff.
+- `AGENT_UPDATE_PUBLIC_KEY` enthält den hexadezimalen Ed25519-Schlüssel. Nach erfolgreicher Manifest- und Binary-Prüfung wird `AGENT_SYSTEMD_SERVICE` (Standard: `sentinel-agent.service`) kontrolliert neugestartet.
+
+Diese Funktionen benötigen einen produktiven Hub-Vertrag, eine Host-Key-/Signaturverwaltung und eine definierte Freigabe-Policy; sie sollten nicht mit Mock-Daten vorgeführt werden.

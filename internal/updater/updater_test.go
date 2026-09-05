@@ -45,3 +45,28 @@ func TestVerifySignatureRejectsTamperedBinary(t *testing.T) {
 		t.Fatal("tampered binary passed signature verification")
 	}
 }
+
+func TestAtomicReplaceSynchronizesAndPreservesNewBinary(t *testing.T) {
+	directory := t.TempDir()
+	source := filepath.Join(directory, "download")
+	target := filepath.Join(directory, "agent")
+	if err := os.WriteFile(source, []byte("new-agent"), 0600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	if err := os.WriteFile(target, []byte("old-agent"), 0700); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	if err := atomicReplace(source, target); err != nil {
+		t.Fatalf("atomic replace: %v", err)
+	}
+	content, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	if string(content) != "new-agent" {
+		t.Fatalf("unexpected target content: %q", content)
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("source should remain available for caller cleanup: %v", err)
+	}
+}

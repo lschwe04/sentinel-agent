@@ -8,8 +8,10 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,6 +28,7 @@ import (
 	"sentinel-agent/internal/config"
 	"sentinel-agent/internal/diagnostics"
 	"sentinel-agent/internal/executor"
+	"sentinel-agent/internal/hardening"
 	"sentinel-agent/internal/identity"
 	"sentinel-agent/internal/updater"
 
@@ -91,6 +94,8 @@ func main() {
 	if runtimeConfig.Load().CollectorInterval <= 0 {
 		_ = runtimeConfig.Update(config.RuntimeConfig{CollectorInterval: 30 * time.Second, LogLevel: slog.LevelInfo})
 	}
+	fimScanner := hardening.NewFIMScanner(configureFIMPaths())
+	fimScanner.BuildBaseline()
 
 	// 2. Automatisches Self-Enrollment beim Start
 	if hubBaseURL != "" && enrollToken != "" {
@@ -98,7 +103,9 @@ func main() {
 			performAutoEnrollment(ctx, hubBaseURL, enrollToken, nodeID, agentID, custInt, requestHeaders)
 		}
 	}
-	_, err = diagnostics.Start(ctx, getEnvOrDefault("AGENT_DEBUG_SOCKET", "/run/sentinel-agent-debug.sock"))
+	_, err = diagnostics.StartWithHandlers(ctx, getEnvOrDefault("AGENT_DEBUG_SOCKET", "/run/sentinel-agent-debug.sock"), map[string]http.HandlerFunc{
+		"/api/v1/hardening": executor.RunAnsiblePlaybook,
+	})
 	if err != nil {
 		slog.Warn("Lokaler Diagnose-Socket konnte nicht gestartet werden", "component", "diagnostics", "error", err)
 	}
@@ -111,7 +118,7 @@ func main() {
 	engineDone := make(chan struct{})
 	go func() {
 		defer close(engineDone)
-		startResilientEngine(ctx, diskBuffer, runtimeConfig, nodeID, agentID, tenantID, customerID, requestHeaders, hubMetricsURL, authToken)
+		startResilientEngine(ctx, diskBuffer, runtimeConfig, fimScanner, nodeID, agentID, tenantID, customerID, requestHeaders, hubMetricsURL, authToken)
 	}()
 	startRuntimeConfigPoller(ctx, runtimeConfig, level, requestHeaders)
 	startMemoryWatchdog(ctx, diskBuffer, int64(getEnvInt("AGENT_MEMORY_LIMIT_BYTES", 50*1024*1024)))
@@ -132,8 +139,8 @@ func main() {
 	case <-shutdownCtx.Done():
 		slog.Warn("Telemetry-Engine wurde beim Shutdown nicht rechtzeitig beendet", "component", "lifecycle")
 	}
-	if err := diskBuffer.Sync(); err != nil {
-		slog.Error("Disk-Buffer konnte beim Shutdown nicht synchronisiert werden", "component", "buffer", "error", err)
+	if err := diskBuffer.Close(); err != nil {
+		slog.Error("Disk-Buffer konnte beim Shutdown nicht synchronisiert und gesperrt werden", "component", "buffer", "error", err)
 	}
 }
 
@@ -160,7 +167,10 @@ func startRuntimeConfigPoller(ctx context.Context, store *config.Store, level *s
 			return err
 		}
 		_, _ = daemon.SdNotify(false, "STOPPING=1")
-		os.Exit(0)
+		serviceName := getEnvOrDefault("AGENT_SYSTEMD_SERVICE", "sentinel-agent.service")
+		if err := updater.RestartService(context.Background(), serviceName); err != nil {
+			return fmt.Errorf("restart updated agent service: %w", err)
+		}
 		return nil
 	}
 	poller, err := config.NewPollerWithOptions(endpoint, 5*time.Minute, store, level, headers, updateHandler, func() (*http.Client, error) {
@@ -260,7 +270,7 @@ func performAutoEnrollment(ctx context.Context, hubBaseURL, enrollToken, nodeID,
 	}
 }
 
-func startResilientEngine(ctx context.Context, buf *buffer.DiskBuffer, runtimeConfig *config.Store, nodeID, agentID, tenantID, customerID string, headers http.Header, hubMetricsURL, authToken string) {
+func startResilientEngine(ctx context.Context, buf *buffer.DiskBuffer, runtimeConfig *config.Store, fimScanner *hardening.FIMScanner, nodeID, agentID, tenantID, customerID string, headers http.Header, hubMetricsURL, authToken string) {
 	timer := time.NewTimer(runtimeConfig.Load().CollectorInterval)
 	defer timer.Stop()
 	breaker, err := collector.NewCircuitBreaker(5, 60*time.Second)
@@ -310,11 +320,14 @@ func startResilientEngine(ctx context.Context, buf *buffer.DiskBuffer, runtimeCo
 			breaker.RecordSuccess()
 			return nil
 		}); err != nil {
-			slog.Warn("Metriken konnten nicht übertragen werden; verbleiben im Disk-Buffer", "error", err)
+			slog.Warn("Metriken konnten nicht übertragen werden; verbleiben im Disk-Buffer", "error", err, "failure_kind", classifyHubError(err))
 		}
 	}
 
 	// Direkt nach dem Start berichten, damit lokale Demos und Healthchecks nicht 30 Sekunden warten.
+	if reportFIMAlerts(buf, fimScanner, nodeID) {
+		sendBatch()
+	}
 	collectAndBufferMetrics(ctx, buf, nodeID, agentID, tenantID, customerID)
 	sendBatch()
 	for {
@@ -322,6 +335,9 @@ func startResilientEngine(ctx context.Context, buf *buffer.DiskBuffer, runtimeCo
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+			if reportFIMAlerts(buf, fimScanner, nodeID) {
+				sendBatch()
+			}
 			collectAndBufferMetrics(ctx, buf, nodeID, agentID, tenantID, customerID)
 			sendBatch()
 			interval := runtimeConfig.Load().CollectorInterval
@@ -331,6 +347,34 @@ func startResilientEngine(ctx context.Context, buf *buffer.DiskBuffer, runtimeCo
 			timer.Reset(interval)
 		}
 	}
+}
+
+func configureFIMPaths() []string {
+	value := strings.TrimSpace(os.Getenv("AGENT_FIM_PATHS"))
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	paths := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if path := strings.TrimSpace(part); path != "" {
+			paths = append(paths, path)
+		}
+	}
+	return paths
+}
+
+func reportFIMAlerts(buf *buffer.DiskBuffer, scanner *hardening.FIMScanner, nodeID string) bool {
+	if scanner == nil {
+		return false
+	}
+	alerts := scanner.CheckIntegrity(nodeID)
+	for _, alert := range alerts {
+		if err := buf.Enqueue("fim_alert", alert); err != nil {
+			slog.Error("FIM-Alarm konnte nicht persistiert werden", "component", "fim", "path", alert.FilePath, "event", alert.Event, "error", err)
+		}
+	}
+	return len(alerts) > 0
 }
 
 func identityHeaders(agentIdentity identity.Identity) http.Header {
@@ -400,17 +444,28 @@ func createMTLSClient() (*http.Client, error) {
 
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("mTLS client certificate/key could not be loaded (%s, %s): %w", certPath, keyPath, err)
+	}
+	if len(cert.Certificate) == 0 {
+		return nil, fmt.Errorf("mTLS client certificate %s contains no certificate", certPath)
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return nil, fmt.Errorf("mTLS client certificate %s is invalid: %w", certPath, err)
+	}
+	now := time.Now()
+	if now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
+		return nil, fmt.Errorf("mTLS client certificate %s is expired or not yet valid (valid %s to %s)", certPath, leaf.NotBefore.UTC().Format(time.RFC3339), leaf.NotAfter.UTC().Format(time.RFC3339))
 	}
 
 	caCert, err := os.ReadFile(caPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("CA certificate %s could not be read: %w", caPath, err)
 	}
 
 	caCertPool := x509.NewCertPool()
 	if !caCertPool.AppendCertsFromPEM(caCert) {
-		return nil, fmt.Errorf("failed to append CA cert")
+		return nil, fmt.Errorf("CA certificate %s is invalid", caPath)
 	}
 
 	return &http.Client{
@@ -423,6 +478,30 @@ func createMTLSClient() (*http.Client, error) {
 		},
 		Timeout: 15 * time.Second,
 	}, nil
+}
+
+func classifyHubError(err error) string {
+	if errors.Is(err, collector.ErrCircuitOpen) {
+		return "circuit_breaker_cooldown"
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "context_canceled_or_deadline"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return "network_timeout"
+		}
+		return "network_error"
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "status: 401") || strings.Contains(message, "status: 403") {
+		return "authentication_failed_or_expired"
+	}
+	if strings.Contains(message, "certificate") || strings.Contains(message, "tls") {
+		return "tls_or_certificate_error"
+	}
+	return "hub_request_error"
 }
 
 func getEnvOrDefault(key, defaultValue string) string {
