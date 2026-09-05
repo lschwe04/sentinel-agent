@@ -3,9 +3,11 @@
   hosts: customer_servers
   become: yes
   vars:
-    hub_base_url: "https://hub.systemhaus-xy.de/api/v1"
-    enroll_token: "systemhaus-master-secret-token"
-    tenant_id: "systemhaus-xy"
+    hub_base_url: "https://hub.systemhaus-xy.de"
+    enroll_token: "{{ vault_enroll_token }}"
+    tenant_id: "{{ vault_tenant_id }}"
+    customer_id: "{{ vault_customer_id }}"
+    agent_encryption_key: "{{ vault_agent_encryption_key }}"
 
   tasks:
     - name: Create agent installation directory
@@ -16,6 +18,7 @@
       loop:
         - /opt/sentinel-agent
         - /etc/sentinel/certs
+        - /var/lib/sentinel
 
     - name: Copy agent binary
       copy:
@@ -41,7 +44,7 @@
 
     - name: Copy systemd service file
       copy:
-        src: "../sentinel-agent.service"
+        src: "../systemd/sentinel-agent.service"
         dest: "/etc/systemd/system/sentinel-agent.service"
         mode: '0644'
 

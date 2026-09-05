@@ -15,10 +15,23 @@ ENROLL_TOKEN="${ENROLL_TOKEN:-}"
 TENANT_ID="${TENANT_ID:-}"
 CUSTOMER_ID="${CUSTOMER_ID:-}"
 NODE_ID="${NODE_ID:-$(hostname)}"
+AGENT_ENCRYPTION_KEY="${AGENT_ENCRYPTION_KEY:-}"
 
 if [ -z "$ENROLL_TOKEN" ] || [ -z "$TENANT_ID" ] || [ -z "$CUSTOMER_ID" ]; then
   echo "[-] Fehler: Die Variablen ENROLL_TOKEN, TENANT_ID und CUSTOMER_ID müssen gesetzt sein."
   echo "Beispiel: TENANT_ID=systemhaus-xy CUSTOMER_ID=1 ENROLL_TOKEN=xyz bash install.sh"
+  exit 1
+fi
+
+HUB_BASE_URL="${HUB_BASE_URL%/}"
+HUB_BASE_URL="${HUB_BASE_URL%/api/v1}"
+
+if [ -z "$AGENT_ENCRYPTION_KEY" ]; then
+  command -v openssl >/dev/null 2>&1 || { echo "[-] Fehler: openssl wird zur Schlüsselgenerierung benötigt."; exit 1; }
+  AGENT_ENCRYPTION_KEY="$(openssl rand -hex 16)"
+fi
+if [ "${#AGENT_ENCRYPTION_KEY}" -ne 32 ]; then
+  echo "[-] Fehler: AGENT_ENCRYPTION_KEY muss exakt 32 Bytes lang sein (für ASCII-Schlüssel 32 Zeichen)."
   exit 1
 fi
 
@@ -55,6 +68,7 @@ HUB_BASE_URL=${HUB_BASE_URL}
 ENROLL_TOKEN=${ENROLL_TOKEN}
 HUB_METRICS_URL=${HUB_BASE_URL}/api/v1/metrics
 AGENT_STATE_DIR=/var/lib/sentinel
+AGENT_ENCRYPTION_KEY=${AGENT_ENCRYPTION_KEY}
 AGENT_CERT_PATH=/etc/sentinel/certs/agent.crt
 AGENT_KEY_PATH=/etc/sentinel/certs/agent.key
 CA_CERT_PATH=/etc/sentinel/certs/ca.crt
@@ -83,12 +97,19 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 MemoryDenyWriteExecute=true
 StateDirectory=sentinel
+ReadWritePaths=/var/lib/sentinel
 
 EnvironmentFile=/etc/default/sentinel-agent
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+if [ ! -f /etc/sentinel/certs/agent.crt ] || [ ! -f /etc/sentinel/certs/agent.key ] || [ ! -f /etc/sentinel/certs/ca.crt ]; then
+  echo "[-] mTLS-Zertifikate fehlen unter /etc/sentinel/certs; der Dienst wird nicht gestartet."
+  echo "    Hinterlegen Sie agent.crt, agent.key und ca.crt und führen Sie danach aus: systemctl enable --now sentinel-agent"
+  exit 1
+fi
 
 systemctl daemon-reload
 systemctl enable --now sentinel-agent

@@ -19,6 +19,7 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 MemoryDenyWriteExecute=true
 StateDirectory=sentinel
+ReadWritePaths=/var/lib/sentinel
 
 # Environment Variables (können auch über /etc/default/sentinel-agent geladen werden)
 EnvironmentFile=/etc/default/sentinel-agent

@@ -9,21 +9,24 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 type ReverseTunnel struct {
-	HubSSHAddr  string
-	LocalAddr   string
-	RemotePort  int
-	PrivKeyPath string
+	HubSSHAddr     string
+	LocalAddr      string
+	RemotePort     int
+	PrivKeyPath    string
+	KnownHostsPath string
 }
 
 func NewReverseTunnel(hubAddr, localAddr string, remotePort int, privKeyPath string) *ReverseTunnel {
 	return &ReverseTunnel{
-		HubSSHAddr:  hubAddr,
-		LocalAddr:   localAddr,
-		RemotePort:  remotePort,
-		PrivKeyPath: privKeyPath,
+		HubSSHAddr:     hubAddr,
+		LocalAddr:      localAddr,
+		RemotePort:     remotePort,
+		PrivKeyPath:    privKeyPath,
+		KnownHostsPath: os.Getenv("AGENT_SSH_KNOWN_HOSTS"),
 	}
 }
 
@@ -45,8 +48,16 @@ func (t *ReverseTunnel) Start(ctx context.Context) {
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(signer),
 		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // In Prod: Strict Host Key Checking verwenden
-		Timeout:         15 * time.Second,
+		Timeout: 15 * time.Second,
+	}
+	if t.KnownHostsPath == "" {
+		slog.Error("SSH-Tunnel wird aus Sicherheitsgründen abgebrochen: Known-Hosts-Datei fehlt")
+		return
+	}
+	config.HostKeyCallback, err = knownhosts.New(t.KnownHostsPath)
+	if err != nil {
+		slog.Error("Known-Hosts-Datei für SSH-Tunnel konnte nicht geladen werden", "error", err)
+		return
 	}
 
 	for {

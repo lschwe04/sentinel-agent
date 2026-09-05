@@ -1,22 +1,25 @@
-# SentinelCore Endpoint Agent 🤖
+# SentinelCore Agent
 
-Der SentinelCore Agent läuft als ressourcenschonender Systemdienst auf Linux- und Windows-Endpunkten, erfasst Telemetriedaten, überwacht die Integrität (FIM) und setzt CIS-Hardening-Richtlinien um.
+SentinelCore ist ein Linux/systemd-Agent für Telemetrie, verschlüsseltes Offline-Puffern und mTLS-Übertragung an einen Hub. Die unterstützte Produktionsplattform ist Rocky Linux 9; Windows ist derzeit kein implementiertes Deployment-Ziel.
 
----
+## Demo
 
-## ⚡ Quick Start / Installation
+Die lokale End-to-End-Demo mit Mock-Hub steht in [DEMO.md](DEMO.md). Sie benötigt nur Go und Python und zeigt Enrollment, AES-256-GCM-Disk-Buffer, GZIP-Batch und Telemetrie-Upload.
 
-### Linux (Systemd & Sandbox-Hardening)
-Führen Sie das Installationsskript mit einem gültigen Enrollment-Token aus:
+## Produktion
+
+Der Installer ist [install.sh](install.sh). Er benötigt `HUB_BASE_URL`, `ENROLL_TOKEN`, `TENANT_ID`, `CUSTOMER_ID` sowie vor dem Dienststart gültige mTLS-Dateien unter `/etc/sentinel/certs/`. Ein zufälliger 32-Byte-Buffer-Schlüssel wird automatisch erzeugt und in `/etc/default/sentinel-agent` abgelegt.
+
 ```bash
-sudo ./deployments/linux/install-agent.sh <DEIN_ENROLLMENT_TOKEN> "[https://hub.sentinel-core.local:8443](https://hub.sentinel-core.local:8443)"
+sudo env HUB_BASE_URL=https://hub.example.com \
+	ENROLL_TOKEN='aus-Secret-Store' TENANT_ID='systemhaus-demo' CUSTOMER_ID='1' \
+	bash install.sh
+```
 
-Hinweis: Der Agent richtet sich automatisch als systemd-Dienst mit striktem Sandboxing (ProtectSystem=strict) ein.
+Ansible-Deployment ist in [deployments/ansible/install-agent.yml](deployments/ansible/install-agent.yml) beschrieben. Secrets müssen über Ansible Vault oder einen externen Secret-Store als `vault_*`-Variablen geliefert werden.
 
-Windows (PowerShell / GPO / MSI-Wrapper)
-Führen Sie die PowerShell als Administrator aus:
+## Validierung
 
-Set-ExecutionPolicy Bypass -Scope Process -Force
-.\deployments\windows\install-agent.ps1 -EnrollmentToken "<DEIN_ENROLLMENT_TOKEN>" -HubUrl "[https://hub.sentinel-core.local:8443](https://hub.sentinel-core.local:8443)"
-
-Hinweis: Registriert den Agenten automatisch als Windows-Dienst (SentinelAgent) mit automatischem Start.
+```bash
+go test ./...
+```

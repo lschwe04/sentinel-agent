@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -80,13 +81,17 @@ func performAutoEnrollment(ctx context.Context, hubBaseURL, enrollToken, nodeID 
 	}
 
 	data, _ := json.Marshal(enrollPayload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, hubBaseURL+"/enroll", bytes.NewBuffer(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(hubBaseURL, "/")+"/api/v1/agent/enroll", bytes.NewBuffer(data))
 	if err != nil {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client, err := createHTTPClient(hubBaseURL)
+	if err != nil {
+		slog.Error("Enrollment-Client konnte nicht initialisiert werden", "error", err)
+		return
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		slog.Warn("Auto-Enrollment Verbindung zum Hub fehlgeschlagen (offline mode active)", "error", err)
@@ -100,51 +105,57 @@ func performAutoEnrollment(ctx context.Context, hubBaseURL, enrollToken, nodeID 
 }
 
 func startResilientEngine(ctx context.Context, buf *buffer.DiskBuffer, nodeID, tenantID, customerID, hubMetricsURL, authToken string) {
-	ticker := time.NewTicker(30 * time.Second)
+	interval := time.Duration(getEnvInt("AGENT_REPORT_INTERVAL_SECONDS", 30)) * time.Second
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	client, err := createMTLSClient()
-	if err != nil {
-		slog.Error("mTLS Client Initialisierungsfehler", "error", err)
-		return
+	sendBatch := func() {
+		client, err := createHTTPClient(hubMetricsURL)
+		if err != nil {
+			slog.Error("HTTP/mTLS Client Initialisierungsfehler", "error", err)
+			return
+		}
+
+		if err := buf.FlushCompress(ctx, func(ctx context.Context, compressedGzip []byte) error {
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, hubMetricsURL, bytes.NewBuffer(compressedGzip))
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Content-Encoding", "gzip")
+			if authToken != "" {
+				req.Header.Set("Authorization", "Bearer "+authToken)
+			}
+			req.Header.Set("X-Tenant-ID", tenantID)
+
+			resp, err := client.Do(req)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode >= 400 {
+				return fmt.Errorf("hub rejected batch payload with status: %d", resp.StatusCode)
+			}
+			return nil
+		}); err != nil {
+			slog.Warn("Metriken konnten nicht übertragen werden; verbleiben im Disk-Buffer", "error", err)
+		}
 	}
 
+	// Direkt nach dem Start berichten, damit lokale Demos und Healthchecks nicht 30 Sekunden warten.
+	collectAndBufferMetrics(ctx, buf, nodeID, tenantID, customerID)
+	sendBatch()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Metriken einsammeln und in den lokalen Ringpuffer schreiben
 			collectAndBufferMetrics(ctx, buf, nodeID, tenantID, customerID)
-
-			// Puffer komprimiert an den Hub übertragen (GZIP Batch Flush)
-			err := buf.FlushCompress(ctx, func(ctx context.Context, compressedGzip []byte) error {
-				req, err := http.NewRequestWithContext(ctx, http.MethodPost, hubMetricsURL, bytes.NewBuffer(compressedGzip))
-				if err != nil {
-					return err
-				}
-				req.Header.Set("Content-Type", "application/json")
-				req.Header.Set("Content-Encoding", "gzip")
-				if authToken != "" {
-					req.Header.Set("Authorization", "Bearer "+authToken)
-				}
-				req.Header.Set("X-Tenant-ID", tenantID)
-
-				resp, err := client.Do(req)
-				if err != nil {
-					return err
-				}
-				defer resp.Body.Close()
-
-				if resp.StatusCode >= 400 {
-					return fmt.Errorf("hub rejected batch payload with status: %d", resp.StatusCode)
-				}
-				return nil
-			})
-
-			if err != nil {
-				slog.Debug("Flush vorübergehend nicht möglich (Netzwerk offline), Daten sicher im Puffer", "error", err)
-			}
+			sendBatch()
 		}
 	}
 }
@@ -178,7 +189,19 @@ func collectAndBufferMetrics(ctx context.Context, buf *buffer.DiskBuffer, nodeID
 		"timestamp":      time.Now().Format(time.RFC3339),
 	}
 
-	_ = buf.Enqueue("system_metric", payload)
+	if err := buf.Enqueue("system_metric", payload); err != nil {
+		slog.Error("Metrik konnte nicht im Disk-Buffer persistiert werden", "error", err)
+	}
+}
+
+func createHTTPClient(endpoint string) (*http.Client, error) {
+	if strings.HasPrefix(endpoint, "http://") {
+		if os.Getenv("AGENT_DEMO_MODE") != "true" {
+			return nil, fmt.Errorf("unverschlüsseltes HTTP ist nur mit AGENT_DEMO_MODE=true erlaubt")
+		}
+		return &http.Client{Timeout: 15 * time.Second}, nil
+	}
+	return createMTLSClient()
 }
 
 func createMTLSClient() (*http.Client, error) {
@@ -218,4 +241,12 @@ func getEnvOrDefault(key, defaultValue string) string {
 		return val
 	}
 	return defaultValue
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	value, err := strconv.Atoi(os.Getenv(key))
+	if err != nil {
+		return defaultValue
+	}
+	return value
 }

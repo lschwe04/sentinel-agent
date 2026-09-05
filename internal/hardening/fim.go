@@ -65,8 +65,6 @@ func (f *FIMScanner) CheckIntegrity(nodeID string) []FIMAlert {
 					Event:     "MODIFIED",
 					Timestamp: time.Now().UTC(),
 				})
-				// Aktualisiere Cache, um Alarm-Flut zu steuern, oder halte den Zustand
-				f.baselineCache[path] = currentHash
 			}
 		}
 	}

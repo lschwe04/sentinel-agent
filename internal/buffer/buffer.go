@@ -50,7 +50,7 @@ func NewDiskBuffer(storagePath string, maxSize int, masterKey []byte) (*DiskBuff
 	}
 
 	if err := buf.loadFromDisk(); err != nil && !os.IsNotExist(err) {
-		slog.Warn("Failed to restore buffer from disk, starting fresh", "error", err)
+		return nil, fmt.Errorf("failed to restore encrypted buffer: %w", err)
 	}
 
 	return buf, nil
