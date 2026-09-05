@@ -1,27 +1,22 @@
-# 🛡️ SentinelCore Agent
+# SentinelCore Endpoint Agent 🤖
 
-The lightweight, secure, and sandboxed telemetry and compliance agent for Linux systems, built for enterprise environments.
+Der SentinelCore Agent läuft als ressourcenschonender Systemdienst auf Linux- und Windows-Endpunkten, erfasst Telemetriedaten, überwacht die Integrität (FIM) und setzt CIS-Hardening-Richtlinien um.
 
-## ⚙️ Architecture & Security
+---
 
-* **Systemd Sandboxing:** Runs with extreme hardening (`ProtectSystem=strict`, `NoNewPrivileges=true`, `MemoryDenyWriteExecute`).
-* **Low Footprint:** Written in Go with minimal resource consumption (`gopsutil`).
-* **Auto-Enrollment:** Supports automated bootstrapping and registration with the SentinelCore Hub.
+## ⚡ Quick Start / Installation
 
-## 🚀 Installation via Ansible
-
-Use the provided Ansible playbook to roll out the agent across hundreds of customer nodes instantly:
-
+### Linux (Systemd & Sandbox-Hardening)
+Führen Sie das Installationsskript mit einem gültigen Enrollment-Token aus:
 ```bash
-ansible-playbook -i inventory.ini install-agent.yml
+sudo ./deployments/linux/install-agent.sh <DEIN_ENROLLMENT_TOKEN> "[https://hub.sentinel-core.local:8443](https://hub.sentinel-core.local:8443)"
 
-🛠️ Environment Variables
-Configure the agent via /etc/default/sentinel-agent:
+Hinweis: Der Agent richtet sich automatisch als systemd-Dienst mit striktem Sandboxing (ProtectSystem=strict) ein.
 
-NODE_ID: Unique identifier for the host
+Windows (PowerShell / GPO / MSI-Wrapper)
+Führen Sie die PowerShell als Administrator aus:
 
-TENANT_ID: System house identifier
+Set-ExecutionPolicy Bypass -Scope Process -Force
+.\deployments\windows\install-agent.ps1 -EnrollmentToken "<DEIN_ENROLLMENT_TOKEN>" -HubUrl "[https://hub.sentinel-core.local:8443](https://hub.sentinel-core.local:8443)"
 
-CUSTOMER_ID: End-customer database ID
-
-HUB_BASE_URL: Endpoint of the central hub
+Hinweis: Registriert den Agenten automatisch als Windows-Dienst (SentinelAgent) mit automatischem Start.
