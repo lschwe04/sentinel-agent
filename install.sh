@@ -20,7 +20,17 @@ if [ -z "$ENROLL_TOKEN" ] || [ -z "$TENANT_ID" ] || [ -z "$CUSTOMER_ID" ]; then
   exit 1
 fi
 
-mkdir -p /etc/sentinel/certs /opt/sentinel /etc/default
+INSTALL_DIR="/opt/sentinel-agent"
+mkdir -p /etc/sentinel/certs "$INSTALL_DIR" /etc/default
+
+# Automatisches Bauen des Binaries, falls der Go-Quellcode vorhanden ist
+if [ -f "cmd/agent/main.go" ]; then
+  echo "[*] Kompiliere Sentinel-Agent direkt ins Zielverzeichnis..."
+  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o "$INSTALL_DIR/sentinel-agent" cmd/agent/main.go
+  chmod +x "$INSTALL_DIR/sentinel-agent"
+else
+  echo "[-] Warnung: 'cmd/agent/main.go' nicht gefunden. Stellen Sie sicher, dass das Binary manuell unter $INSTALL_DIR/sentinel-agent abgelegt wird."
+fi
 
 cat << EOF > /etc/default/sentinel-agent
 NODE_ID=${NODE_ID}
@@ -44,8 +54,8 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/sentinel
-ExecStart=/opt/sentinel/sentinel-agent
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$INSTALL_DIR/sentinel-agent
 Restart=always
 RestartSec=10
 
@@ -65,4 +75,6 @@ EOF
 
 systemctl daemon-reload
 systemctl enable sentinel-agent
-echo "[+] Sentinel-Agent erfolgreich eingerichtet! Starte den Service nach Platzieren der mTLS Zertifikate mit: systemctl start sentinel-agent"
+
+echo "[+] Sentinel-Agent erfolgreich eingerichtet!"
+echo "[*] Vergessen Sie nicht, die mTLS-Zertifikate unter /etc/sentinel/certs/ zu hinterlegen."
