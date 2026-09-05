@@ -32,6 +32,7 @@ type DiskBuffer struct {
 	maxFileBytes int64
 	aesKey       []byte
 	queue        []MetricPayload
+	diskOnly     bool
 }
 
 const defaultMaxFileBytes int64 = 10 * 1024 * 1024
@@ -73,6 +74,9 @@ func NewDiskBufferWithLimits(storagePath string, maxSize int, maxFileBytes int64
 func (b *DiskBuffer) Enqueue(eventType string, data any) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if err := b.ensureLoadedLocked(); err != nil {
+		return err
+	}
 	previousQueue := append([]MetricPayload(nil), b.queue...)
 
 	item := MetricPayload{
@@ -99,12 +103,34 @@ func (b *DiskBuffer) Enqueue(eventType string, data any) error {
 func (b *DiskBuffer) Sync() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.diskOnly {
+		return nil
+	}
 	return b.persistToDiskLocked()
+}
+
+// ReleaseMemoryToDisk keeps the durable queue on disk and releases its in-memory copy.
+func (b *DiskBuffer) ReleaseMemoryToDisk() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.diskOnly {
+		return nil
+	}
+	if err := b.persistToDiskLocked(); err != nil {
+		return err
+	}
+	b.queue = nil
+	b.diskOnly = true
+	return nil
 }
 
 // FlushCompress (Ihr genialer Code bleibt erhalten!)
 func (b *DiskBuffer) FlushCompress(ctx context.Context, sendFunc func(ctx context.Context, compressedGzip []byte) error) error {
 	b.mu.Lock()
+	if err := b.ensureLoadedLocked(); err != nil {
+		b.mu.Unlock()
+		return err
+	}
 	if len(b.queue) == 0 {
 		b.mu.Unlock()
 		return nil
@@ -199,7 +225,21 @@ func (b *DiskBuffer) writeAtomically(ciphertext []byte) error {
 func (b *DiskBuffer) loadFromDisk() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.loadFromDiskLocked()
+}
 
+func (b *DiskBuffer) ensureLoadedLocked() error {
+	if !b.diskOnly {
+		return nil
+	}
+	if err := b.loadFromDiskLocked(); err != nil {
+		return err
+	}
+	b.diskOnly = false
+	return nil
+}
+
+func (b *DiskBuffer) loadFromDiskLocked() error {
 	info, err := os.Stat(b.filePath)
 	if err != nil {
 		return err

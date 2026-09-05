@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"time"
+
+	"sentinel-agent/internal/identity"
 )
 
 type ExecutionResponse struct {
@@ -34,19 +36,16 @@ func RunAnsiblePlaybook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jobID := fmt.Sprintf("job-%d", time.Now().UnixNano())
-
 	go func(id string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 		defer cancel()
 
 		slog.Info("Starte asynchronen Härtungsprozess", "job_id", id)
 		cmd := exec.CommandContext(ctx, "/usr/bin/ansible-playbook", "/etc/sentinel/playbooks/hardening.yml")
-
 		output, err := cmd.CombinedOutput()
 		success := true
 		msg := "Hardening successfully applied"
 		openIssues := 0
-
 		if err != nil {
 			slog.Error("Ansible Härtung fehlgeschlagen", "job_id", id, "error", err, "output", string(output))
 			success = false
@@ -55,17 +54,12 @@ func RunAnsiblePlaybook(w http.ResponseWriter, r *http.Request) {
 		} else {
 			slog.Info("Ansible Härtung erfolgreich abgeschlossen", "job_id", id)
 		}
-
 		reportBackToHub(success, msg, openIssues)
 	}(jobID)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(ExecutionResponse{
-		JobID:   jobID,
-		Status:  "accepted",
-		Message: "Hardening process queued and running in background",
-	})
+	_ = json.NewEncoder(w).Encode(ExecutionResponse{JobID: jobID, Status: "accepted", Message: "Hardening process queued and running in background"})
 }
 
 func reportBackToHub(success bool, message string, openIssues int) {
@@ -77,33 +71,16 @@ func reportBackToHub(success bool, message string, openIssues int) {
 	if nodeID == "" {
 		nodeID = "unknown-node"
 	}
-
-	report := HardeningReport{
-		NodeID:     nodeID,
-		Success:    success,
-		Message:    message,
-		OpenIssues: openIssues,
-	}
-
+	report := HardeningReport{NodeID: nodeID, Success: success, Message: message, OpenIssues: openIssues}
 	data, err := json.Marshal(report)
 	if err != nil {
 		slog.Error("Fehler beim Marshalling des Reports", "error", err)
 		return
 	}
 
-	certPath := os.Getenv("AGENT_CERT_PATH")
-	if certPath == "" {
-		certPath = "/etc/sentinel/certs/agent.crt"
-	}
-	keyPath := os.Getenv("AGENT_KEY_PATH")
-	if keyPath == "" {
-		keyPath = "/etc/sentinel/certs/agent.key"
-	}
-	caPath := os.Getenv("CA_CERT_PATH")
-	if caPath == "" {
-		caPath = "/etc/sentinel/certs/ca.crt"
-	}
-
+	certPath := getEnvOrDefault("AGENT_CERT_PATH", "/etc/sentinel/certs/agent.crt")
+	keyPath := getEnvOrDefault("AGENT_KEY_PATH", "/etc/sentinel/certs/agent.key")
+	caPath := getEnvOrDefault("CA_CERT_PATH", "/etc/sentinel/certs/ca.crt")
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
 		slog.Error("mTLS Zertifikat Fehler beim Callback", "error", err)
@@ -115,18 +92,11 @@ func reportBackToHub(success bool, message string, openIssues int) {
 		return
 	}
 	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				Certificates: []tls.Certificate{cert},
-				RootCAs:      caCertPool,
-				MinVersion:   tls.VersionTLS13,
-			},
-		},
-		Timeout: 10 * time.Second,
+	if !caCertPool.AppendCertsFromPEM(caCert) {
+		slog.Error("CA Zertifikat konnte nicht geladen werden")
+		return
 	}
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: caCertPool, MinVersion: tls.VersionTLS13}}, Timeout: 10 * time.Second}
 
 	req, err := http.NewRequest(http.MethodPost, hubURL, bytes.NewBuffer(data))
 	if err != nil {
@@ -134,6 +104,14 @@ func reportBackToHub(success bool, message string, openIssues int) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	identityPath := getEnvOrDefault("AGENT_IDENTITY_PATH", "/etc/sentinel-agent/identity.json")
+	if agentIdentity, identityErr := identity.LoadFromEnvironmentOrFile(identityPath); identityErr == nil {
+		req.Header.Set("X-Tenant-ID", agentIdentity.TenantID)
+		req.Header.Set("X-Agent-ID", agentIdentity.AgentID)
+	}
+	if authToken := os.Getenv("ENTERPRISE_AUTH_TOKEN"); authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -141,6 +119,12 @@ func reportBackToHub(success bool, message string, openIssues int) {
 		return
 	}
 	defer resp.Body.Close()
-
 	slog.Info("Hardening-Status erfolgreich an Hub gemeldet", "status_code", resp.StatusCode)
+}
+
+func getEnvOrDefault(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
 }

@@ -18,6 +18,19 @@ sudo env HUB_BASE_URL=https://hub.example.com \
 
 Ansible-Deployment ist in [deployments/ansible/install-agent.yml](deployments/ansible/install-agent.yml) beschrieben. Secrets müssen über Ansible Vault oder einen externen Secret-Store als `vault_*`-Variablen geliefert werden.
 
+## Identity, OTA und Diagnose
+
+Die lokale Identity liegt unter `/etc/sentinel-agent/identity.json` und enthält `agent_id` sowie `tenant_id`. OTA-Updates benötigen zusätzlich einen Ed25519-Public-Key als Hexwert in `AGENT_UPDATE_PUBLIC_KEY`. Der Hub signiert dabei den rohen SHA-256-Digest des Binary:
+
+```bash
+openssl genpkey -algorithm ED25519 -out update-signing.key
+openssl pkey -in update-signing.key -pubout -outform DER | tail -c 32 | xxd -p -c 64 > update-signing-public.hex
+```
+
+Der Public-Key wird über einen Secret-Store verteilt. Private Keys bleiben ausschließlich in der signierenden Hub-/Release-Pipeline. Die Signatur wird als Hex-Ed25519-Signatur im Update-Manifest übertragen; ohne gültige Signatur wird kein Binary ersetzt.
+
+pprof ist ausschließlich über `/run/sentinel-agent-debug.sock` erreichbar. Der Socket hat `0600` und wird beim Context-gesteuerten Shutdown entfernt. Für den reproduzierbaren Race-Test steht `make test-race` bereit; die Ausführung erfolgt in `Dockerfile.test` mit Linux-GCC.
+
 ## Validierung
 
 ```bash

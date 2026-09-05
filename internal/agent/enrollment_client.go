@@ -9,6 +9,8 @@ import (
 	"os"
 	"time"
 
+	"sentinel-agent/internal/identity"
+
 	"github.com/denisbrodbeck/machineid" // Standard-Bibliothek für sichere Hardware-UUIDs in Go
 )
 
@@ -59,7 +61,20 @@ func PerformInitialEnrollment(hubURL string, enrollmentToken string) error {
 		Timeout:   15 * time.Second,
 	}
 
-	resp, err := client.Post(hubURL+"/api/v1/agent/enroll", "application/json", bytes.NewBuffer(jsonData))
+	req, err := http.NewRequest(http.MethodPost, hubURL+"/api/v1/agent/enroll", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("enrollment request konnte nicht erstellt werden: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	identityPath := os.Getenv("AGENT_IDENTITY_PATH")
+	if identityPath == "" {
+		identityPath = "/etc/sentinel-agent/identity.json"
+	}
+	if agentIdentity, identityErr := identity.LoadFromEnvironmentOrFile(identityPath); identityErr == nil {
+		req.Header.Set("X-Tenant-ID", agentIdentity.TenantID)
+		req.Header.Set("X-Agent-ID", agentIdentity.AgentID)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("verbindung zum Systemhaus-Hub fehlgeschlagen: %v", err)
 	}

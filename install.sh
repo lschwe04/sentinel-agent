@@ -36,7 +36,7 @@ if [ "${#AGENT_ENCRYPTION_KEY}" -ne 32 ]; then
 fi
 
 INSTALL_DIR="/opt/sentinel-agent"
-mkdir -p /etc/sentinel/certs "$INSTALL_DIR" /etc/default /var/lib/sentinel
+mkdir -p /etc/sentinel/certs /etc/sentinel-agent "$INSTALL_DIR" /etc/default /var/lib/sentinel
 
 if ! command -v go >/dev/null 2>&1; then
   echo "[-] Fehler: Go wurde nicht gefunden. Bitte Go installieren und das Skript erneut ausführen."
@@ -67,14 +67,22 @@ CUSTOMER_ID=${CUSTOMER_ID}
 HUB_BASE_URL=${HUB_BASE_URL}
 ENROLL_TOKEN=${ENROLL_TOKEN}
 HUB_METRICS_URL=${HUB_BASE_URL}/api/v1/metrics
+HUB_CONFIG_URL=${HUB_BASE_URL}/api/v1/agent/config
 AGENT_STATE_DIR=/var/lib/sentinel
 AGENT_ENCRYPTION_KEY=${AGENT_ENCRYPTION_KEY}
 AGENT_CERT_PATH=/etc/sentinel/certs/agent.crt
 AGENT_KEY_PATH=/etc/sentinel/certs/agent.key
 CA_CERT_PATH=/etc/sentinel/certs/ca.crt
+AGENT_UPDATE_PUBLIC_KEY=${AGENT_UPDATE_PUBLIC_KEY:-}
+AGENT_BINARY_PATH=$INSTALL_DIR/sentinel-agent
 EOF
 
 chmod 600 /etc/default/sentinel-agent
+
+cat << EOF > /etc/sentinel-agent/identity.json
+{"agent_id":"${NODE_ID}","tenant_id":"${TENANT_ID}"}
+EOF
+chmod 600 /etc/sentinel-agent/identity.json
 
 cat << EOF > /etc/systemd/system/sentinel-agent.service
 [Unit]

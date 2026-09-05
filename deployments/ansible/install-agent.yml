@@ -8,6 +8,7 @@
     tenant_id: "{{ vault_tenant_id }}"
     customer_id: "{{ vault_customer_id }}"
     agent_encryption_key: "{{ vault_agent_encryption_key }}"
+    agent_update_public_key: "{{ vault_agent_update_public_key }}"
 
   tasks:
     - name: Create agent installation directory
@@ -18,6 +19,7 @@
       loop:
         - /opt/sentinel-agent
         - /etc/sentinel/certs
+        - /etc/sentinel-agent
         - /var/lib/sentinel
 
     - name: Copy agent binary
@@ -40,6 +42,12 @@
       template:
         src: "templates/sentinel-agent.env.j2"
         dest: "/etc/default/sentinel-agent"
+        mode: '0600'
+
+    - name: Write agent identity
+      copy:
+        content: "{{ {'agent_id': inventory_hostname, 'tenant_id': tenant_id} | to_json }}\n"
+        dest: /etc/sentinel-agent/identity.json
         mode: '0600'
 
     - name: Copy systemd service file

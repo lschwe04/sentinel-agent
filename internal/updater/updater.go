@@ -1,8 +1,8 @@
-// sentinel-agent: internal/updater/updater.go
 package updater
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,106 +11,159 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"time"
+	"strings"
 )
+
+const maxBinarySize int64 = 256 * 1024 * 1024
 
 type UpdateManifest struct {
 	Version   string `json:"version"`
 	BinaryURL string `json:"binary_url"`
-	Checksum  string `json:"checksum"`  // SHA256 des Binaries
-	Signature string `json:"signature"` // Hex-kodierte Signatur
+	Checksum  string `json:"checksum"`
+	Signature string `json:"signature"`
 }
 
-// CheckAndApplyUpdate prüft beim Hub periodisch auf neue Agenten-Versionen
-func CheckAndApplyUpdate(ctx context.Context, hubUpdateURL string, currentVersion string, caCertPath string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hubUpdateURL+"?version="+currentVersion, nil)
+type Updater struct {
+	client    *http.Client
+	publicKey ed25519.PublicKey
+	target    string
+	headers   http.Header
+}
+
+func New(client *http.Client, publicKey ed25519.PublicKey, target string) (*Updater, error) {
+	return NewWithHeaders(client, publicKey, target, nil)
+}
+
+func NewWithHeaders(client *http.Client, publicKey ed25519.PublicKey, target string, headers http.Header) (*Updater, error) {
+	if client == nil || len(publicKey) != ed25519.PublicKeySize || target == "" {
+		return nil, fmt.Errorf("updater requires HTTP client, Ed25519 public key and target")
+	}
+	return &Updater{client: client, publicKey: append(ed25519.PublicKey(nil), publicKey...), target: target, headers: headers.Clone()}, nil
+}
+
+func (u *Updater) Apply(ctx context.Context, manifestURL string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
 	if err != nil {
 		return err
 	}
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	copyHeaders(req.Header, u.headers)
+	resp, err := u.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("update check failed: %w", err)
+		return fmt.Errorf("update manifest request failed: %w", err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNoContent {
-		// Agent ist aktuell
-		return nil
-	}
-
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code from update server: %d", resp.StatusCode)
+		return fmt.Errorf("update manifest returned HTTP %d", resp.StatusCode)
 	}
-
 	var manifest UpdateManifest
-	if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
-		return fmt.Errorf("failed to decode update manifest: %w", err)
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&manifest); err != nil {
+		return fmt.Errorf("decode update manifest: %w", err)
 	}
-
-	slog.Info("Neues Agenten-Update entdeckt, starte sicheren Download...", "version", manifest.Version)
-
-	// 1. Binärdatei temporär herunterladen
-	tmpFile, err := downloadBinary(ctx, manifest.BinaryURL)
+	if manifest.BinaryURL == "" || manifest.Checksum == "" || manifest.Signature == "" {
+		return fmt.Errorf("update manifest is incomplete")
+	}
+	tmpFile, err := downloadBinary(ctx, u.client, manifest.BinaryURL, u.headers)
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmpFile)
-
-	// 2. SHA256 Checksumme verifizieren (Sicherheit NR. 1)
-	if err := verifyChecksum(tmpFile, manifest.Checksum); err != nil {
-		return fmt.Errorf("checksum verification failed: %w", err)
+	if err := verifySignature(tmpFile, manifest.Checksum, manifest.Signature, u.publicKey); err != nil {
+		return fmt.Errorf("update signature verification failed: %w", err)
 	}
-
-	// 3. Binärdatei an Ort des Originals verschieben & Service via systemd neustarten
-	targetPath := "/opt/sentinel-agent/sentinel-agent"
-	if err := atomicReplace(tmpFile, targetPath); err != nil {
+	if err := atomicReplace(tmpFile, u.target); err != nil {
 		return fmt.Errorf("atomic binary replacement failed: %w", err)
 	}
-
-	slog.Info("Agent erfolgreich aktualisiert. Starte Systemd-Service neu...")
-	cmd := exec.CommandContext(ctx, "systemctl", "restart", "sentinel-agent")
-	return cmd.Run()
+	slog.Info("Agent-Binary erfolgreich aktualisiert", "component", "updater", "version", manifest.Version)
+	return nil
 }
 
-func downloadBinary(_ context.Context, url string) (string, error) {
-	resp, err := http.Get(url)
+func downloadBinary(ctx context.Context, client *http.Client, binaryURL string, headers http.Header) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, binaryURL, nil)
 	if err != nil {
 		return "", err
 	}
+	copyHeaders(req.Header, headers)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("binary download failed: %w", err)
+	}
 	defer resp.Body.Close()
-
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("binary download returned HTTP %d", resp.StatusCode)
+	}
 	tmp, err := os.CreateTemp("", "sentinel-update-*")
 	if err != nil {
 		return "", err
 	}
-	defer tmp.Close()
-
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
+	name := tmp.Name()
+	if _, err := io.Copy(tmp, io.LimitReader(resp.Body, maxBinarySize+1)); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
 		return "", err
 	}
-
-	return tmp.Name(), nil
+	info, err := tmp.Stat()
+	if err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return "", err
+	}
+	if info.Size() > maxBinarySize {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return "", fmt.Errorf("downloaded binary exceeds %d bytes", maxBinarySize)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	return name, nil
 }
 
-func verifyChecksum(filePath string, expectedSHA256 string) error {
-	f, err := os.Open(filePath)
+func copyHeaders(destination, source http.Header) {
+	for key, values := range source {
+		for _, value := range values {
+			destination.Add(key, value)
+		}
+	}
+}
+
+func verifySignature(filePath, expectedSHA256, encodedSignature string, publicKey ed25519.PublicKey) error {
+	file, err := os.Open(filePath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	defer file.Close()
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil {
 		return err
 	}
+	sum := digest.Sum(nil)
+	if !strings.EqualFold(hex.EncodeToString(sum), expectedSHA256) {
+		return fmt.Errorf("hash mismatch")
+	}
+	signature, err := hex.DecodeString(encodedSignature)
+	if err != nil || len(signature) != ed25519.SignatureSize {
+		return fmt.Errorf("invalid Ed25519 signature encoding")
+	}
+	if !ed25519.Verify(publicKey, sum, signature) {
+		return fmt.Errorf("invalid Ed25519 signature")
+	}
+	return nil
+}
 
-	sum := hex.EncodeToString(h.Sum(nil))
-	if sum != expectedSHA256 {
-		return fmt.Errorf("hash mismatch: got %s, want %s", sum, expectedSHA256)
+func verifyChecksum(filePath, expectedSHA256 string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil {
+		return err
+	}
+	if !strings.EqualFold(hex.EncodeToString(digest.Sum(nil)), expectedSHA256) {
+		return fmt.Errorf("hash mismatch")
 	}
 	return nil
 }
@@ -120,22 +173,32 @@ func atomicReplace(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer input.Close()
-
-	dir := filepath.Dir(dst)
-	tmpDst, err := os.CreateTemp(dir, "sentinel-update-bin-*")
+	tmpDst, err := os.CreateTemp(filepath.Dir(dst), "sentinel-update-bin-*")
 	if err != nil {
+		_ = input.Close()
 		return err
 	}
-	defer tmpDst.Close()
-
+	tmpName := tmpDst.Name()
+	cleanup := true
+	defer func() {
+		_ = input.Close()
+		_ = tmpDst.Close()
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
 	if _, err := io.Copy(tmpDst, input); err != nil {
 		return err
 	}
-
-	if err := os.Chmod(tmpDst.Name(), 0755); err != nil {
+	if err := tmpDst.Chmod(0755); err != nil {
 		return err
 	}
-
-	return os.Rename(tmpDst.Name(), dst)
+	if err := tmpDst.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
 }

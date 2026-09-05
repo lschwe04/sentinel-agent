@@ -101,6 +101,30 @@ func TestDiskBufferDropsOldestEntriesAtFileLimit(t *testing.T) {
 	}
 }
 
+func TestDiskBufferReleasesMemoryWithoutLosingDiskQueue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "buffer.dat")
+	key := []byte("01234567890123456789012345678901")
+	buf, err := NewDiskBuffer(path, 10, key)
+	if err != nil {
+		t.Fatalf("create buffer: %v", err)
+	}
+	if err := buf.Enqueue("demo", "survive-memory-release"); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := buf.ReleaseMemoryToDisk(); err != nil {
+		t.Fatalf("release memory: %v", err)
+	}
+	if len(buf.queue) != 0 || !buf.diskOnly {
+		t.Fatalf("buffer was not released to disk: queue=%d diskOnly=%v", len(buf.queue), buf.diskOnly)
+	}
+	if err := buf.Enqueue("demo", "new-item"); err != nil {
+		t.Fatalf("enqueue after memory release: %v", err)
+	}
+	if len(buf.queue) != 2 {
+		t.Fatalf("disk queue was not reloaded before enqueue: %d items", len(buf.queue))
+	}
+}
+
 func TestDiskBufferRejectsWrongKeyOnRestore(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "buffer.dat")
 	key := []byte("01234567890123456789012345678901")

@@ -1,0 +1,10 @@
+FROM golang:1.26-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc musl-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+ENV CGO_ENABLED=1
+
+CMD ["go", "test", "-race", "-v", "./..."]
