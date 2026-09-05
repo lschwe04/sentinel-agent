@@ -20,6 +20,7 @@ import (
 	"sentinel-agent/internal/buffer"
 	"sentinel-agent/internal/executor"
 
+	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
@@ -66,11 +67,57 @@ func main() {
 	go watchdog.MonitorAndHeal(ctx)
 
 	// 4. Resilienten Collector & Reporter im Hintergrund starten
-	go startResilientEngine(ctx, diskBuffer, nodeID, tenantID, customerID, hubMetricsURL, authToken)
+	engineDone := make(chan struct{})
+	go func() {
+		defer close(engineDone)
+		startResilientEngine(ctx, diskBuffer, nodeID, tenantID, customerID, hubMetricsURL, authToken)
+	}()
+	startSystemdWatchdog(ctx)
+	if _, err := daemon.SdNotify(false, "READY=1"); err != nil {
+		slog.Warn("systemd READY-Nachricht konnte nicht gesendet werden", "component", "systemd", "error", err)
+	}
 
 	slog.Info("Sentinel Agent Enterprise Edition erfolgreich gestartet", "node_id", nodeID, "tenant_id", tenantID)
 	<-ctx.Done()
-	slog.Info("Agent wird geordnet heruntergefahren...")
+	slog.Info("Agent wird geordnet heruntergefahren...", "component", "lifecycle")
+	_, _ = daemon.SdNotify(false, "STOPPING=1")
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+	select {
+	case <-engineDone:
+	case <-shutdownCtx.Done():
+		slog.Warn("Telemetry-Engine wurde beim Shutdown nicht rechtzeitig beendet", "component", "lifecycle")
+	}
+	if err := diskBuffer.Sync(); err != nil {
+		slog.Error("Disk-Buffer konnte beim Shutdown nicht synchronisiert werden", "component", "buffer", "error", err)
+	}
+}
+
+func startSystemdWatchdog(ctx context.Context) {
+	usec, err := daemon.SdWatchdogEnabled(false)
+	if err != nil || usec == 0 {
+		return
+	}
+	interval := time.Duration(usec) * time.Microsecond / 2
+	if interval <= 0 {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if _, err := daemon.SdNotify(false, "WATCHDOG=1"); err != nil {
+					slog.Warn("systemd WATCHDOG-Nachricht konnte nicht gesendet werden", "component", "systemd", "error", err)
+				}
+			}
+		}
+	}()
 }
 
 func performAutoEnrollment(ctx context.Context, hubBaseURL, enrollToken, nodeID string, customerID int) {

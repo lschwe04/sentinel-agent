@@ -26,27 +26,41 @@ type MetricPayload struct {
 }
 
 type DiskBuffer struct {
-	mu       sync.Mutex
-	filePath string
-	maxSize  int
-	aesKey   []byte // NEU: 32-Byte Key für AES-256
-	queue    []MetricPayload
+	mu           sync.Mutex
+	filePath     string
+	maxSize      int
+	maxFileBytes int64
+	aesKey       []byte
+	queue        []MetricPayload
 }
 
-// NewDiskBuffer nimmt nun optional oder direkt einen MasterKey entgegen
+const defaultMaxFileBytes int64 = 10 * 1024 * 1024
+
 func NewDiskBuffer(storagePath string, maxSize int, masterKey []byte) (*DiskBuffer, error) {
+	return NewDiskBufferWithLimits(storagePath, maxSize, defaultMaxFileBytes, masterKey)
+}
+
+// NewDiskBufferWithLimits creates an AES-GCM disk-backed FIFO with item and byte limits.
+func NewDiskBufferWithLimits(storagePath string, maxSize int, maxFileBytes int64, masterKey []byte) (*DiskBuffer, error) {
 	if len(masterKey) != 32 {
 		return nil, errors.New("AES-256 Key muss exakt 32 Byte lang sein")
+	}
+	if maxSize <= 0 {
+		return nil, errors.New("buffer max size must be greater than zero")
+	}
+	if maxFileBytes <= 0 {
+		return nil, errors.New("buffer max file size must be greater than zero")
 	}
 	if err := os.MkdirAll(filepath.Dir(storagePath), 0700); err != nil {
 		return nil, fmt.Errorf("buffer dir creation failed: %w", err)
 	}
 
 	buf := &DiskBuffer{
-		filePath: storagePath,
-		maxSize:  maxSize,
-		aesKey:   masterKey,
-		queue:    make([]MetricPayload, 0),
+		filePath:     storagePath,
+		maxSize:      maxSize,
+		maxFileBytes: maxFileBytes,
+		aesKey:       append([]byte(nil), masterKey...),
+		queue:        make([]MetricPayload, 0),
 	}
 
 	if err := buf.loadFromDisk(); err != nil && !os.IsNotExist(err) {
@@ -59,6 +73,7 @@ func NewDiskBuffer(storagePath string, maxSize int, masterKey []byte) (*DiskBuff
 func (b *DiskBuffer) Enqueue(eventType string, data any) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	previousQueue := append([]MetricPayload(nil), b.queue...)
 
 	item := MetricPayload{
 		ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
@@ -73,7 +88,18 @@ func (b *DiskBuffer) Enqueue(eventType string, data any) error {
 	}
 
 	b.queue = append(b.queue, item)
-	return b.persistToDisk()
+	if err := b.persistToDiskLocked(); err != nil {
+		b.queue = previousQueue
+		return err
+	}
+	return nil
+}
+
+// Sync durably persists the current in-memory queue without contacting the hub.
+func (b *DiskBuffer) Sync() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.persistToDiskLocked()
 }
 
 // FlushCompress (Ihr genialer Code bleibt erhalten!)
@@ -109,17 +135,17 @@ func (b *DiskBuffer) FlushCompress(ctx context.Context, sendFunc func(ctx contex
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	previousQueue := b.queue
 	b.queue = b.queue[len(itemsToSend):]
-	return b.persistToDisk()
-}
-
-// NEU: Verschlüsseltes Speichern auf die Festplatte (AES-256-GCM)
-func (b *DiskBuffer) persistToDisk() error {
-	rawJSON, err := json.Marshal(b.queue)
-	if err != nil {
+	if err := b.persistToDiskLocked(); err != nil {
+		b.queue = previousQueue
 		return err
 	}
+	return nil
+}
 
+func (b *DiskBuffer) persistToDiskLocked() error {
+	hadItems := len(b.queue) > 0
 	block, err := aes.NewCipher(b.aesKey)
 	if err != nil {
 		return err
@@ -130,17 +156,43 @@ func (b *DiskBuffer) persistToDisk() error {
 		return err
 	}
 
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return err
+	for len(b.queue) > 0 {
+		rawJSON, err := json.Marshal(b.queue)
+		if err != nil {
+			return err
+		}
+		if int64(len(rawJSON)+gcm.NonceSize()+gcm.Overhead()) <= b.maxFileBytes {
+			nonce := make([]byte, gcm.NonceSize())
+			if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+				return err
+			}
+			ciphertext := gcm.Seal(nonce, nonce, rawJSON, nil)
+			return b.writeAtomically(ciphertext)
+		}
+
+		slog.Warn("Disk-Buffer-Limit erreicht; ältestes Ereignis verworfen", "component", "buffer", "max_file_bytes", b.maxFileBytes)
+		b.queue = b.queue[1:]
 	}
 
-	ciphertext := gcm.Seal(nonce, nonce, rawJSON, nil)
+	if err := os.Remove(b.filePath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if hadItems {
+		return fmt.Errorf("buffer item exceeds configured file limit of %d bytes", b.maxFileBytes)
+	}
+	return nil
+}
+
+func (b *DiskBuffer) writeAtomically(ciphertext []byte) error {
 	tmpFile := b.filePath + ".tmp"
 	if err := os.WriteFile(tmpFile, ciphertext, 0600); err != nil {
 		return err
 	}
-	return os.Rename(tmpFile, b.filePath)
+	if err := os.Rename(tmpFile, b.filePath); err != nil {
+		_ = os.Remove(tmpFile)
+		return err
+	}
+	return nil
 }
 
 // NEU: Entschlüsseltes Laden von der Festplatte
@@ -148,6 +200,13 @@ func (b *DiskBuffer) loadFromDisk() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	info, err := os.Stat(b.filePath)
+	if err != nil {
+		return err
+	}
+	if info.Size() > b.maxFileBytes {
+		return fmt.Errorf("buffer file exceeds configured limit: %d > %d bytes", info.Size(), b.maxFileBytes)
+	}
 	ciphertext, err := os.ReadFile(b.filePath)
 	if err != nil {
 		return err
@@ -174,5 +233,11 @@ func (b *DiskBuffer) loadFromDisk() error {
 		return errors.New("entschlüsselung fehlgeschlagen - Integritätsverletzung oder falscher Key")
 	}
 
-	return json.Unmarshal(rawJSON, &b.queue)
+	if err := json.Unmarshal(rawJSON, &b.queue); err != nil {
+		return err
+	}
+	if len(b.queue) > b.maxSize {
+		b.queue = b.queue[len(b.queue)-b.maxSize:]
+	}
+	return nil
 }

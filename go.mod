@@ -2,7 +2,10 @@ module sentinel-agent
 
 go 1.26.0
 
-require github.com/shirou/gopsutil/v3 v3.24.5
+require (
+	github.com/coreos/go-systemd/v22 v22.5.0
+	github.com/shirou/gopsutil/v3 v3.24.5
+)
 
 require (
 	github.com/denisbrodbeck/machineid v1.0.1

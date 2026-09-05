@@ -3,13 +3,13 @@ package collector
 
 import (
 	"context"
-	"math/rand"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 )
 
-func StartResilientReporter(ctx context.Context, client *http.Client, reportFunc func()) {
-	// Basis-Intervall von 30 Sekunden
+func StartResilientReporter(ctx context.Context, _ *http.Client, reportFunc func() error) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -18,23 +18,53 @@ func StartResilientReporter(ctx context.Context, client *http.Client, reportFunc
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Jitter: Zufällige Verzögerung von 0 bis 5 Sekunden hinzufügen
-			// Verhindert den "Thundering Herd"-Effekt bei tausenden Agenten
-			jitter := time.Duration(rand.Int63n(5000)) * time.Millisecond
-			time.Sleep(jitter)
-
-			// Führe den eigentlichen Report mit Retry-Backoff aus
-			go executeWithRetry(reportFunc, 3)
+			go func() {
+				_ = executeWithRetry(ctx, reportFunc, 3, time.Second)
+			}()
 		}
 	}
 }
 
-func executeWithRetry(operation func(), maxRetries int) {
-	for i := 0; i < maxRetries; i++ {
-		// operation() gibt in der echten Implementierung einen Error zurück
-		// Hier als Dummy-Struktur für den Architektur-Ansatz
-		operation()
-		return // Bei Erfolg sofort abbrechen
-		// Bei Fehler: time.Sleep(time.Duration(i*2) * time.Second)
+func executeWithRetry(ctx context.Context, operation func() error, maxAttempts int, initialBackoff time.Duration) error {
+	if operation == nil {
+		return fmt.Errorf("retry operation is nil")
 	}
+	if maxAttempts <= 0 {
+		return fmt.Errorf("maxAttempts must be greater than zero")
+	}
+	if initialBackoff <= 0 {
+		initialBackoff = time.Millisecond
+	}
+
+	var lastErr error
+	backoff := initialBackoff
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		started := time.Now()
+		if err := operation(); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			slog.Warn("Reporter-Versuch fehlgeschlagen", "component", "reporter", "retry_count", attempt-1, "duration", time.Since(started), "error", err)
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+	return lastErr
 }

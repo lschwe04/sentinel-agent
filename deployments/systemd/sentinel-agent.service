@@ -3,12 +3,13 @@ Description=SentinelCore Enterprise Security & Monitoring Agent
 After=network.target
 
 [Service]
-Type=simple
+Type=notify
 User=root
 WorkingDirectory=/opt/sentinel-agent
 ExecStart=/opt/sentinel-agent/sentinel-agent
 Restart=always
 RestartSec=10
+WatchdogSec=60s
 
 # Enterprise Sandboxing Best Practices
 ProtectSystem=strict

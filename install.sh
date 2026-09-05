@@ -82,12 +82,13 @@ Description=SentinelCore Enterprise Security & Telemetry Agent
 After=network.target
 
 [Service]
-Type=simple
+Type=notify
 User=root
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/sentinel-agent
 Restart=always
 RestartSec=10
+WatchdogSec=60s
 
 ProtectSystem=strict
 ProtectHome=true
